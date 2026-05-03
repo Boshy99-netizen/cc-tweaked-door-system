@@ -167,38 +167,17 @@ function drawPass()
         term.setTextColor(colors.yellow)
         term.setCursorPos(cx - 3, 11)
         write("[TEAM]")
-        term.setTextColor(colors.lightGray)
-        term.setCursorPos(cx - 6, 13)
-        write("Full Access")
     else
         term.setTextColor(colors.lightBlue)
         term.setCursorPos(cx - 3, 11)
         write("[GUEST]")
-        term.setTextColor(colors.lightGray)
-        term.setCursorPos(cx - 6, 13)
-        write("Single Door")
     end
     
-    -- Status
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 15)
-    write("Status: Active")
-    
-    -- Signal
-    term.setTextColor(colors.lime)
-    term.setCursorPos(3, 17)
-    write("Signal: Transmitting")
-    
-    -- Time
+    -- Time at the bottom
     term.setTextColor(colors.lightGray)
     local timeStr = textutils.formatTime(os.time(), false)
-    term.setCursorPos(cx - math.floor(#timeStr / 2), 19)
+    term.setCursorPos(cx - math.floor(#timeStr / 2), h - 1)
     write(timeStr)
-    
-    -- Instructions
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, h - 2)
-    write("Hold to approach door")
 end
 
 -- ============================================
@@ -231,21 +210,13 @@ function mainLoop()
                 timestamp = os.time()
             })
             
-            -- Update time
+            -- Update time at bottom
             term.setTextColor(colors.lightGray)
             local timeStr = textutils.formatTime(os.time(), false)
-            local w = term.getSize()
+            local w, h = term.getSize()
             local cx = math.floor(w / 2)
-            term.setCursorPos(cx - math.floor(#timeStr / 2), 19)
+            term.setCursorPos(cx - math.floor(#timeStr / 2), h - 1)
             write(timeStr)
-            
-            -- Blink signal indicator
-            term.setTextColor(colors.lime)
-            term.setCursorPos(11, 17)
-            write("*")
-            sleep(0.1)
-            term.setCursorPos(11, 17)
-            write(" ")
             
             timerId = os.startTimer(INTERVAL)
         end
