@@ -838,7 +838,6 @@ function processPing(message, distance, modemSide)
         state.lastPingTime[player] = now
         
         setDoor(targetDoor, true)
-        print("[OPEN] " .. tostring(player) .. " (" .. keyType .. ") door=" .. targetDoor .. " d=" .. string.format("%.1f", distance))
     else
         print("[REJECT] " .. tostring(player) .. " (" .. keyType .. ") - too far d=" .. string.format("%.1f", distance) .. " > radius=" .. targetRadius)
     end
@@ -927,8 +926,10 @@ function mainLoop()
                     local message = event[5]
                     local distance = event[6]
                     
-                    -- DEBUG: print every incoming msg
-                    print("[RX] side=" .. tostring(side) .. " ch=" .. tostring(channel) .. " d=" .. tostring(distance) .. " type=" .. (type(message) == "table" and tostring(message.type) or type(message)) .. " from=" .. (type(message) == "table" and tostring(message.player) or "?"))
+                    -- DEBUG: print only non-PING incoming messages so OWNER_COMMAND is visible
+                    if type(message) == "table" and message.type ~= "KEY_PING" then
+                        print("[RX] type=" .. tostring(message.type) .. " ch=" .. tostring(channel) .. " from=" .. tostring(message.player))
+                    end
                     
                     if channel == KEY_CHANNEL and type(message) == "table" then
                         if message.type == "KEY_PING" then
