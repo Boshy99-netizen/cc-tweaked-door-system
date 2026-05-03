@@ -44,6 +44,9 @@ local state = {
 local prevStatusState = nil
 local prevControlState = nil
 
+-- Periodic broadcast counter (every Nth timer tick)
+local broadcastTick = 0
+
 -- ============================================
 -- SAVE/LOAD PERSISTENT DATA
 -- ============================================
@@ -602,10 +605,7 @@ end
 function execAction(action)
     if action == "toggle_lock" then
         state.locked = not state.locked
-        if state.locked then
-            setDoor(1, false)
-            setDoor(2, false)
-        end
+        -- Lock only changes permission state, doesn't slam doors shut.
     elseif action == "toggle_door1" then
         state.manualOverride1 = not state.manualOverride1
         setDoor(1, not state.door1Open)
@@ -750,11 +750,9 @@ function handleOwnerCommand(message)
         state.manualOverride1 = false; state.manualOverride2 = false
     elseif cmd == "toggle_lock" then
         state.locked = not state.locked
-        if state.locked then
-            setDoor(1, false); setDoor(2, false)
-            state.manualOverride1 = false
-            state.manualOverride2 = false
-        end
+        -- Note: don't physically close doors here.
+        -- Lock just changes the permission check for future pings.
+        -- Doors held by non-owner pings will close on PING_TIMEOUT (~2s) naturally.
     elseif cmd == "add_guest" then
         if type(data) == "string" and data ~= "" then
             state.allowedGuests[data] = true
@@ -780,6 +778,7 @@ function processPing(message, distance, modemSide)
     local keyType = message.keyType or "guest"
     
     if type(distance) ~= "number" then
+        print("[REJECT] " .. tostring(player) .. " (" .. keyType .. ") - no distance (wired modem?)")
         return
     end
     
@@ -799,16 +798,21 @@ function processPing(message, distance, modemSide)
     -- Check lock (only owner can open when locked)
     if state.locked then
         if player ~= OWNER_NAME or keyType ~= "owner" then
+            print("[REJECT] " .. tostring(player) .. " (" .. keyType .. ") - base is LOCKED")
             return
         end
     end
     
     -- Check permissions
     if keyType == "owner" then
-        if player ~= OWNER_NAME then return end
+        if player ~= OWNER_NAME then
+            print("[REJECT] " .. tostring(player) .. " - claims owner but name != " .. OWNER_NAME)
+            return
+        end
     elseif keyType == "team" then
         -- Team/Clan: must be in guest list (treated as trusted)
         if player ~= OWNER_NAME and not state.allowedGuests[player] then
+            print("[REJECT] " .. tostring(player) .. " (team) - NOT in guest list. Add via owner key.")
             return
         end
         -- Team opens BOTH doors when near ANY modem
@@ -816,6 +820,7 @@ function processPing(message, distance, modemSide)
     else
         -- Regular guest: must be in list
         if player ~= OWNER_NAME and not state.allowedGuests[player] then
+            print("[REJECT] " .. tostring(player) .. " (guest) - NOT in guest list. Add via owner key.")
             return
         end
     end
@@ -840,6 +845,9 @@ function processPing(message, distance, modemSide)
             setDoor(1, true)
             setDoor(2, true)
         end
+        print("[OPEN] " .. tostring(player) .. " (" .. keyType .. ") door=" .. tostring(targetDoor) .. " d=" .. string.format("%.1f", distance))
+    else
+        print("[REJECT] " .. tostring(player) .. " (" .. keyType .. ") - too far d=" .. string.format("%.1f", distance) .. " > radius=" .. targetRadius)
     end
 end
 
@@ -880,8 +888,14 @@ function mainLoop()
                     
                     for player, data in pairs(state.activePings) do
                         if now - data.time < PING_TIMEOUT then
-                            if data.door == 1 then door1Active = true end
-                            if data.door == 2 then door2Active = true end
+                            if data.door == 1 then
+                                door1Active = true
+                            elseif data.door == 2 then
+                                door2Active = true
+                            elseif data.door == "both" then
+                                door1Active = true
+                                door2Active = true
+                            end
                         else
                             state.activePings[player] = nil
                         end
@@ -906,12 +920,22 @@ function mainLoop()
                         drawControlMonitor()
                     end
                     
+                    -- Periodic broadcast every ~2s so keys can show base state
+                    broadcastTick = broadcastTick + 1
+                    if broadcastTick >= 4 then
+                        broadcastTick = 0
+                        sendBaseStatus()
+                    end
+                    
                 elseif event[1] == "modem_message" then
                     local side = event[2]
                     local channel = event[3]
                     local replyChannel = event[4]
                     local message = event[5]
                     local distance = event[6]
+                    
+                    -- DEBUG: print every incoming msg
+                    print("[RX] side=" .. tostring(side) .. " ch=" .. tostring(channel) .. " d=" .. tostring(distance) .. " type=" .. (type(message) == "table" and tostring(message.type) or type(message)) .. " from=" .. (type(message) == "table" and tostring(message.player) or "?"))
                     
                     if channel == KEY_CHANNEL and type(message) == "table" then
                         if message.type == "KEY_PING" then
