@@ -732,7 +732,11 @@ function sendGuestList(modemSide)
 end
 
 function handleOwnerCommand(message)
-    if message.player ~= OWNER_NAME then return end
+    print("[CMD] from='" .. tostring(message.player) .. "' cmd='" .. tostring(message.command) .. "'")
+    if message.player ~= OWNER_NAME then
+        print("[CMD-REJECT] '" .. tostring(message.player) .. "' != OWNER_NAME '" .. OWNER_NAME .. "' (case-sensitive!)")
+        return
+    end
     local cmd = message.command
     local data = message.data
 
@@ -750,18 +754,19 @@ function handleOwnerCommand(message)
         state.manualOverride1 = false; state.manualOverride2 = false
     elseif cmd == "toggle_lock" then
         state.locked = not state.locked
-        -- Note: don't physically close doors here.
-        -- Lock just changes the permission check for future pings.
-        -- Doors held by non-owner pings will close on PING_TIMEOUT (~2s) naturally.
+        print("[LOCK] base is now " .. (state.locked and "LOCKED" or "OPEN"))
+        -- Lock only changes permission state, doesn't slam doors shut.
     elseif cmd == "add_guest" then
         if type(data) == "string" and data ~= "" then
             state.allowedGuests[data] = true
             savePersistentData()
+            print("[GUEST] added: " .. data)
         end
     elseif cmd == "remove_guest" then
         if type(data) == "string" then
             state.allowedGuests[data] = nil
             savePersistentData()
+            print("[GUEST] removed: " .. data)
         end
     end
 end
@@ -782,6 +787,7 @@ function processPing(message, distance, modemSide)
         return
     end
     
+    -- Determine target door from which modem received the ping
     local targetDoor = nil
     local targetRadius = nil
     
@@ -795,30 +801,25 @@ function processPing(message, distance, modemSide)
         return
     end
     
-    -- Check lock (only owner can open when locked)
-    if state.locked then
-        if player ~= OWNER_NAME or keyType ~= "owner" then
-            print("[REJECT] " .. tostring(player) .. " (" .. keyType .. ") - base is LOCKED")
-            return
-        end
-    end
-    
-    -- Check permissions
+    -- Permission checks per key type
     if keyType == "owner" then
+        -- Owner: always works (even when locked)
         if player ~= OWNER_NAME then
             print("[REJECT] " .. tostring(player) .. " - claims owner but name != " .. OWNER_NAME)
             return
         end
     elseif keyType == "team" then
-        -- Team/Clan: must be in guest list (treated as trusted)
+        -- Team: always works (LOCK is ignored), but must be in guest list
         if player ~= OWNER_NAME and not state.allowedGuests[player] then
             print("[REJECT] " .. tostring(player) .. " (team) - NOT in guest list. Add via owner key.")
             return
         end
-        -- Team opens BOTH doors when near ANY modem
-        targetDoor = "both"
     else
-        -- Regular guest: must be in list
+        -- Guest: only works when base is NOT locked
+        if state.locked then
+            print("[REJECT] " .. tostring(player) .. " (guest) - base is LOCKED, guests denied")
+            return
+        end
         if player ~= OWNER_NAME and not state.allowedGuests[player] then
             print("[REJECT] " .. tostring(player) .. " (guest) - NOT in guest list. Add via owner key.")
             return
@@ -836,16 +837,8 @@ function processPing(message, distance, modemSide)
         }
         state.lastPingTime[player] = now
         
-        -- Open door(s)
-        if targetDoor == 1 then
-            setDoor(1, true)
-        elseif targetDoor == 2 then
-            setDoor(2, true)
-        elseif targetDoor == "both" then
-            setDoor(1, true)
-            setDoor(2, true)
-        end
-        print("[OPEN] " .. tostring(player) .. " (" .. keyType .. ") door=" .. tostring(targetDoor) .. " d=" .. string.format("%.1f", distance))
+        setDoor(targetDoor, true)
+        print("[OPEN] " .. tostring(player) .. " (" .. keyType .. ") door=" .. targetDoor .. " d=" .. string.format("%.1f", distance))
     else
         print("[REJECT] " .. tostring(player) .. " (" .. keyType .. ") - too far d=" .. string.format("%.1f", distance) .. " > radius=" .. targetRadius)
     end
