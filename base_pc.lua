@@ -247,39 +247,72 @@ function setDoor(doorNum, isOpen)
 end
 
 -- ============================================
--- STATUS MONITOR (OUTSIDE) - SIMPLIFIED
+-- STATUS MONITOR (OUTSIDE) - BEAUTIFUL FRAME
 -- ============================================
 
 function drawStatusMonitor()
     local mon = config.statusMonitor
     if not mon then return end
     
-    mon.setTextScale(1.0)
+    mon.setTextScale(0.8)
     mon.setBackgroundColor(colors.black)
     mon.clear()
     
     local w, h = mon.getSize()
-    local cx = math.floor(w / 2)
+    
+    -- Draw frame border
+    mon.setTextColor(colors.gray)
+    -- Top and bottom borders
+    for x = 1, w do
+        mon.setCursorPos(x, 1)
+        mon.write("-")
+        mon.setCursorPos(x, h)
+        mon.write("-")
+    end
+    -- Side borders
+    for y = 2, h - 1 do
+        mon.setCursorPos(1, y)
+        mon.write("|")
+        mon.setCursorPos(w, y)
+        mon.write("|")
+    end
+    -- Corners
+    mon.setCursorPos(1, 1)
+    mon.write("+")
+    mon.setCursorPos(w, 1)
+    mon.write("+")
+    mon.setCursorPos(1, h)
+    mon.write("+")
+    mon.setCursorPos(w, h)
+    mon.write("+")
+    
+    -- Calculate center positions
+    local line1 = "==Base " .. OWNER_NAME .. "=="
+    local line2 = "Base Status"
+    local line3 = state.locked and "LOCKED" or "OPEN"
+    
+    local x1 = math.floor((w - #line1) / 2) + 1
+    local x2 = math.floor((w - #line2) / 2) + 1
+    local x3 = math.floor((w - #line3) / 2) + 1
     
     -- Line 1: ==Base Boshy99==
     mon.setTextColor(colors.white)
-    mon.setCursorPos(cx - 8, 2)
-    mon.write("==Base " .. OWNER_NAME .. "==")
+    mon.setCursorPos(x1, 3)
+    mon.write(line1)
     
     -- Line 2: Base Status
     mon.setTextColor(colors.lightGray)
-    mon.setCursorPos(cx - 5, 4)
-    mon.write("Base Status")
+    mon.setCursorPos(x2, 5)
+    mon.write(line2)
     
-    -- Line 3: OPEN or LOCKED (big, centered)
-    mon.setCursorPos(cx - 4, 6)
+    -- Line 3: OPEN or LOCKED
+    mon.setCursorPos(x3, 7)
     if state.locked then
         mon.setTextColor(colors.red)
-        mon.write("LOCKED")
     else
         mon.setTextColor(colors.lime)
-        mon.write("OPEN")
     end
+    mon.write(line3)
 end
 
 -- ============================================
