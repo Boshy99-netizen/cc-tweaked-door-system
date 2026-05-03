@@ -8,6 +8,7 @@ local OWNER_NAME = "Boshy99"
 local DEFAULT_RADIUS = 5
 local PING_TIMEOUT = 2
 local KEY_CHANNEL = 100
+local REPLY_CHANNEL = 101
 
 -- ============================================
 -- PERIPHERAL CONFIG
@@ -692,6 +693,82 @@ function handleKeyboardInput()
 end
 
 -- ============================================
+-- REPLIES TO KEYS
+-- ============================================
+
+function sendBaseStatus(modemSide)
+    local payload = {
+        type = "BASE_STATUS",
+        locked = state.locked,
+        door1Open = state.door1Open,
+        door2Open = state.door2Open,
+    }
+    local function send(name)
+        if not name then return end
+        local m = peripheral.wrap(name)
+        if m and m.transmit then
+            m.transmit(REPLY_CHANNEL, KEY_CHANNEL, payload)
+        end
+    end
+    if modemSide then
+        send(modemSide)
+    else
+        send(config.modem1)
+        send(config.modem2)
+    end
+end
+
+function sendGuestList(modemSide)
+    local guests = {}
+    for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
+    table.sort(guests)
+    local m = peripheral.wrap(modemSide)
+    if m and m.transmit then
+        m.transmit(REPLY_CHANNEL, KEY_CHANNEL, {
+            type = "GUEST_LIST",
+            guests = guests,
+        })
+    end
+end
+
+function handleOwnerCommand(message)
+    if message.player ~= OWNER_NAME then return end
+    local cmd = message.command
+    local data = message.data
+
+    if cmd == "open_door" then
+        if data == 1 then setDoor(1, true); state.manualOverride1 = true
+        elseif data == 2 then setDoor(2, true); state.manualOverride2 = true end
+    elseif cmd == "close_door" then
+        if data == 1 then setDoor(1, false); state.manualOverride1 = false
+        elseif data == 2 then setDoor(2, false); state.manualOverride2 = false end
+    elseif cmd == "open_all" then
+        setDoor(1, true); setDoor(2, true)
+        state.manualOverride1 = true; state.manualOverride2 = true
+    elseif cmd == "close_all" then
+        setDoor(1, false); setDoor(2, false)
+        state.manualOverride1 = false; state.manualOverride2 = false
+    elseif cmd == "toggle_lock" then
+        state.locked = not state.locked
+        if state.locked then
+            setDoor(1, false); setDoor(2, false)
+            state.manualOverride1 = false
+            state.manualOverride2 = false
+        end
+    elseif cmd == "add_guest" then
+        if type(data) == "string" and data ~= "" then
+            state.allowedGuests[data] = true
+            savePersistentData()
+        end
+    elseif cmd == "remove_guest" then
+        if type(data) == "string" then
+            state.allowedGuests[data] = nil
+            savePersistentData()
+        end
+    end
+end
+
+-- ============================================
 -- KEY PROCESSING - PER DOOR WITH INDIVIDUAL RADIUS
 -- ============================================
 
@@ -836,13 +913,27 @@ function mainLoop()
                     local message = event[5]
                     local distance = event[6]
                     
-                    if channel == KEY_CHANNEL then
-                        if side == config.modem1 or side == config.modem2 then
-                            processPing(message, distance, side)
+                    if channel == KEY_CHANNEL and type(message) == "table" then
+                        if message.type == "KEY_PING" then
+                            if side == config.modem1 or side == config.modem2 then
+                                processPing(message, distance, side)
+                                if message.keyType == "owner" and message.player == OWNER_NAME then
+                                    sendBaseStatus(side)
+                                end
+                                prevStatusState = nil
+                                prevControlState = nil
+                                drawStatusMonitor()
+                                drawControlMonitor()
+                            end
+                        elseif message.type == "OWNER_COMMAND" then
+                            handleOwnerCommand(message)
+                            sendBaseStatus(side)
                             prevStatusState = nil
                             prevControlState = nil
                             drawStatusMonitor()
                             drawControlMonitor()
+                        elseif message.type == "REQUEST_GUESTS" then
+                            sendGuestList(side)
                         end
                     end
                     
@@ -862,75 +953,6 @@ function mainLoop()
         end
     )
 end
-
-elseif event[1] == "modem_message" then
-    local side = event[2]
-    local channel = event[3]
-    local replyChannel = event[4]
-    local message = event[5]
-    local distance = event[6]
-    
-    if channel == KEY_CHANNEL then
-        -- Regular ping
-        if side == config.modem1 or side == config.modem2 then
-            processPing(message, distance, side)
-            prevStatusState = nil
-            prevControlState = nil
-            drawStatusMonitor()
-            drawControlMonitor()
-        end
-        
-        -- Owner commands
-        if type(message) == "table" and message.type == "OWNER_COMMAND" then
-            if message.player == OWNER_NAME and message.keyType == "owner" then
-                local cmd = message.command
-                local data = message.data
-                
-                if cmd == "open_door" then
-                    if data == 1 then setDoor(1, true); state.manualOverride1 = true
-                    elseif data == 2 then setDoor(2, true); state.manualOverride2 = true end
-                elseif cmd == "close_door" then
-                    if data == 1 then setDoor(1, false); state.manualOverride1 = false
-                    elseif data == 2 then setDoor(2, false); state.manualOverride2 = false end
-                elseif cmd == "open_all" then
-                    setDoor(1, true); setDoor(2, true)
-                    state.manualOverride1 = true; state.manualOverride2 = true
-                elseif cmd == "close_all" then
-                    setDoor(1, false); setDoor(2, false)
-                    state.manualOverride1 = false; state.manualOverride2 = false
-                elseif cmd == "toggle_lock" then
-                    state.locked = not state.locked
-                    if state.locked then
-                        setDoor(1, false); setDoor(2, false)
-                    end
-                elseif cmd == "add_guest" then
-                    state.allowedGuests[data] = true
-                    savePersistentData()
-                elseif cmd == "remove_guest" then
-                    state.allowedGuests[data] = nil
-                    savePersistentData()
-                elseif cmd == "REQUEST_GUESTS" then
-                    -- Send guest list back
-                    local guests = {}
-                    for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
-                    table.sort(guests)
-                    
-                    -- Find modem to reply
-                    if config.mainModem then
-                        config.mainModem.transmit(REPLY_CHANNEL, KEY_CHANNEL, {
-                            type = "GUEST_LIST",
-                            guests = guests
-                        })
-                    end
-                end
-                
-                prevStatusState = nil
-                prevControlState = nil
-                drawStatusMonitor()
-                drawControlMonitor()
-            end
-        end
-    end
 
 function countGuests()
     local c = 0
