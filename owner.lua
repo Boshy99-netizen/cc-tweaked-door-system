@@ -355,7 +355,11 @@ function mainLoop()
                         drawGuestsPage()
                     elseif clicked == "toggle_lock" then
                         sendCommand("toggle_lock")
-                        -- BASE_STATUS reply will trigger redraw
+                        -- Optimistic UI flip so user sees immediate response.
+                        -- The next BASE_STATUS broadcast (~2s) will confirm or revert.
+                        if baseLocked == nil then baseLocked = false end
+                        baseLocked = not baseLocked
+                        drawMainPage()
                     end
                     
                 elseif currentPage == "guests" then
