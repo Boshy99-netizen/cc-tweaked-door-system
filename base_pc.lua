@@ -1,9 +1,9 @@
 -- ============================================
--- BASE DOOR CONTROL SYSTEM v5.4
--- Fixed: lastPingTime, modem selection, relay verify
+-- BASE DOOR CONTROL SYSTEM v6.0
+-- Individual door control per modem
 -- ============================================
 
-local OWNER_NAME = "Boshy99"  -- Твоё имя
+local OWNER_NAME = "Boshy99"
 
 local DEFAULT_RADIUS = 5
 local PING_TIMEOUT = 2
@@ -18,9 +18,9 @@ local config = {
     controlMonitor = nil,
     relay1 = nil,
     relay2 = nil,
-    modem1 = nil,
-    modem2 = nil,
-    mainModem = nil,
+    modem1 = nil,      -- Under door 1 (opens door 1 only)
+    modem2 = nil,      -- Under door 2 (opens door 2 only)
+    mainModem = nil,   -- On PC, receives keys
     mainModemSide = nil,
 }
 
@@ -31,8 +31,8 @@ local state = {
     door2Open = false,
     manualOverride = false,
     allowedGuests = {},
-    activePings = {},
-    lastPingTime = {},  -- FIX: Added this!
+    activePings = {},     -- [playerName] = {time, distance, doorNum}
+    lastPingTime = {},
 }
 
 -- ============================================
@@ -106,7 +106,7 @@ function runConfiguration()
     
     -- Relay 1
     term.clear()
-    print("=== RELAY 1 (Door 1 / Left) ===")
+    print("=== RELAY 1 (Door 1) ===")
     for i, p in ipairs(relays) do print("  " .. i .. ". " .. p.name) end
     print("Select number:")
     choice = read()
@@ -118,7 +118,7 @@ function runConfiguration()
     
     -- Relay 2
     term.clear()
-    print("=== RELAY 2 (Door 2 / Right) ===")
+    print("=== RELAY 2 (Door 2) ===")
     local remRel = {}
     for _, p in ipairs(relays) do
         if p.obj ~= config.relay1 then
@@ -134,9 +134,9 @@ function runConfiguration()
     end
     sleep(0.3)
     
-    -- Modem 1 (under Door 1)
+    -- Modem 1 (under Door 1 - opens door 1)
     term.clear()
-    print("=== MODEM 1 (Wireless under Door 1) ===")
+    print("=== MODEM 1 (Under Door 1 - opens Door 1) ===")
     for i, p in ipairs(modems) do
         print("  " .. i .. ". " .. p.name)
     end
@@ -148,9 +148,9 @@ function runConfiguration()
     end
     sleep(0.3)
     
-    -- Modem 2 (under Door 2)
+    -- Modem 2 (under Door 2 - opens door 2)
     term.clear()
-    print("=== MODEM 2 (Wireless under Door 2) ===")
+    print("=== MODEM 2 (Under Door 2 - opens Door 2) ===")
     local remMod = {}
     for _, p in ipairs(modems) do
         if p.name ~= config.modem1 then
@@ -166,12 +166,10 @@ function runConfiguration()
     end
     sleep(0.3)
     
-    -- Main Modem (receives keys from pocket PCs)
-    -- IMPORTANT: Must be a WIRED modem connected via cable, not "top"!
+    -- Main Modem (on PC, receives keys only)
     term.clear()
-    print("=== MAIN MODEM (receives keys) ===")
-    print("WARNING: Select a wired modem, NOT 'top'!")
-    print("Available modems:")
+    print("=== MAIN MODEM (on PC, receives keys) ===")
+    print("Select the modem ON the PC (usually 'top', 'left', etc.)")
     local remMod2 = {}
     for _, p in ipairs(modems) do
         if p.name ~= config.modem1 and p.name ~= config.modem2 then
@@ -196,6 +194,10 @@ function runConfiguration()
         print("Opened channel " .. KEY_CHANNEL .. " on " .. config.mainModemSide)
     end
     
+    -- Also open door modems to listen for pings (they forward to main modem via cable)
+    -- Actually, in CC:Tweaked, all modems on the network receive messages
+    -- So we need to listen on ALL modems for modem_message events
+    
     saveConfig()
     
     term.clear()
@@ -204,9 +206,9 @@ function runConfiguration()
     print("Control Monitor: " .. (config.controlMonitor and peripheral.getName(config.controlMonitor) or "NONE"))
     print("Relay 1:         " .. (config.relay1 and peripheral.getName(config.relay1) or "NONE"))
     print("Relay 2:         " .. (config.relay2 and peripheral.getName(config.relay2) or "NONE"))
-    print("Modem Door 1:    " .. (config.modem1 or "NONE"))
-    print("Modem Door 2:    " .. (config.modem2 or "NONE"))
-    print("Main Modem:      " .. (config.mainModemSide or "NONE"))
+    print("Modem Door 1:    " .. (config.modem1 or "NONE") .. " -> opens Door 1")
+    print("Modem Door 2:    " .. (config.modem2 or "NONE") .. " -> opens Door 2")
+    print("Main Modem:      " .. (config.mainModemSide or "NONE") .. " -> receives keys")
     print("")
     print("Press Enter to start...")
     read()
@@ -251,7 +253,6 @@ function loadConfig()
     end
     f.close()
     
-    -- Open channel on main modem
     if config.mainModem then
         config.mainModem.open(KEY_CHANNEL)
     end
@@ -260,66 +261,48 @@ function loadConfig()
 end
 
 -- ============================================
--- DOOR CONTROL - FIXED VERIFY
+-- DOOR CONTROL - INDIVIDUAL
 -- ============================================
 
 function setDoor(doorNum, isOpen)
     local relay = (doorNum == 1) and config.relay1 or config.relay2
-    if not relay then 
-        print("ERROR: Relay " .. doorNum .. " not found!")
-        return 
-    end
+    if not relay then return end
     
-    local relayName = peripheral.getName(relay)
-    
-    -- Try to set output
-    local ok = pcall(function()
+    pcall(function()
         relay.setOutput("top", isOpen)
     end)
-    
-    if ok then
-        -- Don't verify, just trust it worked
-        print("Door " .. doorNum .. " (" .. relayName .. ") = " .. tostring(isOpen))
-    else
-        print("ERROR: Failed to set relay " .. doorNum)
-    end
     
     if doorNum == 1 then state.door1Open = isOpen
     else state.door2Open = isOpen end
 end
 
-function openDoors()
-    setDoor(1, true)
-    setDoor(2, true)
-end
-
-function closeDoors()
-    if not state.manualOverride then
-        setDoor(1, false)
-        setDoor(2, false)
-    end
-end
-
 -- ============================================
--- STATUS MONITOR
+-- STATUS MONITOR - NEW FORMAT
 -- ============================================
 
 function drawStatusMonitor()
     local mon = config.statusMonitor
     if not mon then return end
     
-    mon.setTextScale(1.5)
+    mon.setTextScale(1.2)
     mon.setBackgroundColor(colors.black)
     mon.clear()
     
     local w, h = mon.getSize()
     local cx = math.floor(w / 2)
     
+    -- Line 1: ==Base Boshy99==
     mon.setTextColor(colors.white)
-    mon.setCursorPos(cx - 4, 2)
-    mon.write("== BASE ==")
+    mon.setCursorPos(cx - 8, 2)
+    mon.write("==Base " .. OWNER_NAME .. "==")
     
-    mon.setCursorPos(cx - 6, 4)
+    -- Line 2: Base Status
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(cx - 5, 4)
+    mon.write("Base Status")
+    
+    -- Line 3: OPEN or LOCKED
+    mon.setCursorPos(cx - 4, 6)
     if state.locked then
         mon.setTextColor(colors.red)
         mon.write("LOCKED")
@@ -328,22 +311,17 @@ function drawStatusMonitor()
         mon.write("OPEN")
     end
     
-    mon.setCursorPos(cx - 6, 6)
-    if state.door1Open or state.door2Open then
-        mon.setTextColor(colors.yellow)
-        mon.write("DOORS OPEN")
-    else
-        mon.setTextColor(colors.gray)
-        mon.write("DOORS CLOSED")
-    end
+    -- Door status
+    mon.setTextColor(colors.gray)
+    mon.setCursorPos(2, 8)
+    mon.write("Door 1: " .. (state.door1Open and "OPEN" or "CLOSED"))
+    mon.setCursorPos(2, 9)
+    mon.write("Door 2: " .. (state.door2Open and "OPEN" or "CLOSED"))
     
-    mon.setTextColor(colors.lightGray)
-    mon.setCursorPos(cx - 7, 8)
-    mon.write("Radius: " .. state.radius)
-    
+    -- Active players
     local count = 0
     for _ in pairs(state.activePings) do count = count + 1 end
-    mon.setCursorPos(cx - 8, 10)
+    mon.setCursorPos(2, 11)
     mon.write("Nearby: " .. count)
 end
 
@@ -377,33 +355,43 @@ function drawControlMonitor()
             state.locked and colors.white or colors.black,
             "toggle_lock")
     
-    drawBtn(mon, 12, 4, state.manualOverride and "CLOSE" or "OPEN",
-            state.manualOverride and colors.yellow or colors.blue,
-            colors.black,
-            "toggle_manual")
+    drawBtn(mon, 12, 4, "OPEN ALL", colors.blue, colors.white, "open_all")
+    drawBtn(mon, 2, 5, "CLOSE ALL", colors.gray, colors.white, "close_all")
     
     mon.setTextColor(colors.white)
-    mon.setCursorPos(2, 6)
+    mon.setCursorPos(2, 7)
     mon.write("Radius:")
-    drawBtn(mon, 10, 6, "-", colors.gray, colors.white, "radius_down")
+    drawBtn(mon, 10, 7, "-", colors.gray, colors.white, "radius_down")
     mon.setTextColor(colors.yellow)
-    mon.setCursorPos(14, 6)
+    mon.setCursorPos(14, 7)
     mon.write(string.format("%2d", state.radius))
-    drawBtn(mon, 18, 6, "+", colors.gray, colors.white, "radius_up")
+    drawBtn(mon, 18, 7, "+", colors.gray, colors.white, "radius_up")
+    
+    -- Door 1 manual
+    drawBtn(mon, 2, 9, state.door1Open and "D1 CLOSE" or "D1 OPEN",
+            state.door1Open and colors.yellow or colors.green,
+            colors.black,
+            "toggle_door1")
+    
+    -- Door 2 manual
+    drawBtn(mon, 12, 9, state.door2Open and "D2 CLOSE" or "D2 OPEN",
+            state.door2Open and colors.yellow or colors.green,
+            colors.black,
+            "toggle_door2")
     
     local guestCount = 0
     for _ in pairs(state.allowedGuests) do guestCount = guestCount + 1 end
     
     mon.setTextColor(colors.cyan)
-    mon.setCursorPos(2, 8)
+    mon.setCursorPos(2, 11)
     mon.write("Guests: " .. guestCount)
-    drawBtn(mon, 18, 8, "+ ADD", colors.green, colors.white, "add_guest")
+    drawBtn(mon, 18, 11, "+ ADD", colors.green, colors.white, "add_guest")
     
-    local y = 10
+    local y = 13
     local guests = {}
     for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
     
-    for i = 1, math.min(#guests, 8) do
+    for i = 1, math.min(#guests, 6) do
         mon.setTextColor(colors.yellow)
         mon.setCursorPos(2, y)
         mon.write(guests[i])
@@ -412,23 +400,23 @@ function drawControlMonitor()
     end
     
     mon.setTextColor(colors.gray)
-    mon.setCursorPos(2, 19)
+    mon.setCursorPos(2, 20)
     mon.write("Active: " .. countPings())
     
-    drawBtn(mon, 2, 20, "[ RECONFIG ]", colors.purple, colors.white, "reconfig")
+    drawBtn(mon, 2, 21, "[ RECONFIG ]", colors.purple, colors.white, "reconfig")
     
     if inputMode == "add_guest" then
         mon.setBackgroundColor(colors.black)
-        for i = 9, 15 do
+        for i = 11, 17 do
             mon.setCursorPos(2, i)
             mon.write(string.rep(" ", 24))
         end
         mon.setTextColor(colors.white)
-        mon.setCursorPos(2, 10)
-        mon.write("=== ADD GUEST ===")
         mon.setCursorPos(2, 12)
+        mon.write("=== ADD GUEST ===")
+        mon.setCursorPos(2, 14)
         mon.write("Type on PC keyboard:")
-        mon.setCursorPos(2, 15)
+        mon.setCursorPos(2, 16)
         mon.setTextColor(colors.yellow)
         mon.write("> " .. inputBuffer .. "_")
     end
@@ -451,7 +439,7 @@ end
 
 function handleTouch(mx, my)
     if inputMode == "add_guest" then
-        if my < 9 or my > 15 then
+        if my < 11 or my > 17 then
             inputMode = nil
             inputBuffer = ""
             drawControlMonitor()
@@ -471,12 +459,21 @@ function execAction(action)
     if action == "toggle_lock" then
         state.locked = not state.locked
         if state.locked then
-            state.manualOverride = false
-            closeDoors()
+            setDoor(1, false)
+            setDoor(2, false)
         end
-    elseif action == "toggle_manual" then
-        state.manualOverride = not state.manualOverride
-        if state.manualOverride then openDoors() else closeDoors() end
+    elseif action == "open_all" then
+        state.manualOverride = true
+        setDoor(1, true)
+        setDoor(2, true)
+    elseif action == "close_all" then
+        state.manualOverride = false
+        setDoor(1, false)
+        setDoor(2, false)
+    elseif action == "toggle_door1" then
+        setDoor(1, not state.door1Open)
+    elseif action == "toggle_door2" then
+        setDoor(2, not state.door2Open)
     elseif action == "radius_down" then
         if state.radius > 1 then state.radius = state.radius - 1 end
     elseif action == "radius_up" then
@@ -534,10 +531,10 @@ function handleKeyboardInput()
 end
 
 -- ============================================
--- KEY PROCESSING
+-- KEY PROCESSING - PER DOOR
 -- ============================================
 
-function processPing(message, distance)
+function processPing(message, distance, modemSide)
     if type(message) ~= "table" then return end
     if message.type ~= "KEY_PING" then return end
     
@@ -548,7 +545,23 @@ function processPing(message, distance)
         return
     end
     
-    print("DEBUG: " .. player .. " at " .. distance .. " blocks")
+    -- Determine which door based on which modem received the signal
+    local targetDoor = nil
+    
+    if modemSide == config.modem1 then
+        targetDoor = 1  -- Door 1
+    elseif modemSide == config.modem2 then
+        targetDoor = 2  -- Door 2
+    elseif modemSide == config.mainModemSide then
+        -- Main modem receives all signals, but we need to know which door modem is closer
+        -- For now, if received on main modem, open both (or use closest door logic)
+        targetDoor = "both"
+    else
+        -- Unknown modem, ignore
+        return
+    end
+    
+    print("DEBUG: " .. player .. " at " .. distance .. " blocks via " .. modemSide .. " -> Door " .. tostring(targetDoor))
     
     -- Check lock
     if state.locked then
@@ -568,15 +581,28 @@ function processPing(message, distance)
     
     if distance <= state.radius then
         local now = os.clock()
+        
+        -- Store ping with target door
         state.activePings[player] = {
             time = now,
             distance = distance,
-            keyType = keyType
+            keyType = keyType,
+            door = targetDoor,
+            modem = modemSide
         }
-        state.lastPingTime[player] = now  -- FIX: Now works!
+        state.lastPingTime[player] = now
         
-        if not state.door1Open then
-            openDoors()
+        -- Open specific door(s)
+        if targetDoor == 1 then
+            setDoor(1, true)
+        elseif targetDoor == 2 then
+            setDoor(2, true)
+        elseif targetDoor == "both" then
+            -- If on main modem, we can't tell which door, so check both modems
+            -- Actually, in CC:Tweaked all modems on network receive the message
+            -- So we should get separate events for each modem!
+            setDoor(1, true)
+            setDoor(2, true)
         end
     end
 end
@@ -586,7 +612,7 @@ end
 -- ============================================
 
 function mainLoop()
-    print("=== Door System v5.4 ===")
+    print("=== Door System v6.0 ===")
     print("CC:Tweaked 1.117.1")
     print("Owner: " .. OWNER_NAME)
     print("Radius: " .. state.radius)
@@ -600,7 +626,7 @@ function mainLoop()
     print("Modem Door 2: " .. (config.modem2 or "NONE"))
     print("Main Modem:   " .. (config.mainModemSide or "NONE"))
     print("")
-    print("Using modem_message for reliable distance")
+    print("Individual door control per modem")
     print("Channel: " .. KEY_CHANNEL)
     print("")
     
@@ -615,18 +641,28 @@ function mainLoop()
                 
                 if event[1] == "timer" then
                     local now = os.clock()
-                    local anyone = false
+                    local door1Active = false
+                    local door2Active = false
                     
                     for player, data in pairs(state.activePings) do
                         if now - data.time < PING_TIMEOUT then
-                            anyone = true
+                            if data.door == 1 or data.door == "both" then
+                                door1Active = true
+                            end
+                            if data.door == 2 or data.door == "both" then
+                                door2Active = true
+                            end
                         else
                             state.activePings[player] = nil
                         end
                     end
                     
-                    if not anyone and not state.manualOverride then
-                        closeDoors()
+                    -- Close doors if no active pings for that door
+                    if not door1Active and not state.manualOverride then
+                        setDoor(1, false)
+                    end
+                    if not door2Active and not state.manualOverride then
+                        setDoor(2, false)
                     end
                     
                     drawStatusMonitor()
@@ -639,9 +675,9 @@ function mainLoop()
                     local message = event[5]
                     local distance = event[6]
                     
-                    -- Only process from main modem on our channel
-                    if side == config.mainModemSide and channel == KEY_CHANNEL then
-                        processPing(message, distance)
+                    -- Process from ANY modem on our channel
+                    if channel == KEY_CHANNEL then
+                        processPing(message, distance, side)
                     end
                     
                 elseif event[1] == "monitor_touch" then
