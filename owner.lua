@@ -323,10 +323,12 @@ function mainLoop()
     
     drawMainPage()
     
+    local timerId = os.startTimer(INTERVAL)
+    
     while true do
         local event = {os.pullEvent()}
         
-        if event[1] == "timer" then
+        if event[1] == "timer" and event[2] == timerId then
             -- Send regular ping
             modem.transmit(KEY_CHANNEL, REPLY_CHANNEL, {
                 type = "KEY_PING",
@@ -344,6 +346,8 @@ function mainLoop()
                 term.setCursorPos(cx - math.floor(#timeStr / 2), 11)
                 write(timeStr)
             end
+            
+            timerId = os.startTimer(INTERVAL)
             
         elseif event[1] == "modem_message" then
             local side = event[2]
