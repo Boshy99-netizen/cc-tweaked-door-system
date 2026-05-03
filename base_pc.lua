@@ -4,7 +4,7 @@
 -- No GPS, no chat commands
 -- ============================================
 
-local OWNER_NAME = "YOUR_MINECRAFT_NAME"  -- CHANGE THIS!
+local OWNER_NAME = "Boshy99"  -- CHANGE THIS!
 
 local DEFAULT_RADIUS = 5
 local PING_TIMEOUT = 2
