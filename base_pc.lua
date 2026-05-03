@@ -1,11 +1,9 @@
 -- ============================================
--- BASE DOOR CONTROL SYSTEM v5.0
--- CC:Tweaked 1.117.1 - uses modem_message for distance
--- No GPS, no chat commands
+-- BASE DOOR CONTROL SYSTEM v5.1
+-- CC:Tweaked 1.117.1 - Fixed distance handling
 -- ============================================
 
 local OWNER_NAME = "Boshy99"  -- CHANGE THIS!
-
 local DEFAULT_RADIUS = 5
 local PING_TIMEOUT = 2
 
@@ -18,10 +16,6 @@ local config = {
     controlMonitor = nil,
     relay1 = nil,
     relay2 = nil,
-    modem1 = nil,      -- Under door 1
-    modem2 = nil,      -- Under door 2
-    mainModem = nil,   -- Main wireless modem
-    mainModemSide = nil, -- Side name of main modem
 }
 
 local state = {
@@ -32,7 +26,6 @@ local state = {
     manualOverride = false,
     allowedGuests = {},
     activePings = {},
-    lastPingTime = {},
 }
 
 -- ============================================
@@ -47,7 +40,6 @@ function runConfiguration()
     
     local monitors = {}
     local relays = {}
-    local modems = {}
     
     for _, name in ipairs(peripheral.getNames()) do
         local pType = peripheral.getType(name)
@@ -55,13 +47,15 @@ function runConfiguration()
         
         if pType == "monitor" then table.insert(monitors, p)
         elseif pType == "redstone_relay" then table.insert(relays, p)
-        elseif pType == "modem" then table.insert(modems, p)
         end
     end
     
     print("=== ALL PERIPHERALS ===")
-    for i, p in ipairs({table.unpack(monitors), table.unpack(relays), table.unpack(modems)}) do
+    for i, p in ipairs(monitors) do
         print(i .. ". " .. p.name .. " (" .. p.type .. ")")
+    end
+    for i, p in ipairs(relays) do
+        print((#monitors + i) .. ". " .. p.name .. " (" .. p.type .. ")")
     end
     print("")
     
@@ -124,28 +118,12 @@ function runConfiguration()
     end
     sleep(0.3)
     
-    -- Main Modem (for receiving keys)
-    term.clear()
-    print("=== MAIN MODEM (receives keys) ===")
-    for i, p in ipairs(modems) do
-        print("  " .. i .. ". " .. p.name)
-    end
-    print("Select number:")
-    choice = read()
-    if choice ~= "" then
-        local idx = tonumber(choice)
-        if idx and modems[idx] then
-            config.mainModem = modems[idx].obj
-            config.mainModemSide = modems[idx].name
+    -- Open all modems automatically
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            rednet.open(name)
+            print("Opened modem: " .. name)
         end
-    end
-    sleep(0.3)
-    
-    -- Open main modem for listening
-    if config.mainModem then
-        -- Open modem on specific channel
-        config.mainModem.open(100)  -- Channel for door keys
-        print("Opened channel 100 on " .. config.mainModemSide)
     end
     
     saveConfig()
@@ -156,7 +134,6 @@ function runConfiguration()
     print("Control: " .. (config.controlMonitor and peripheral.getName(config.controlMonitor) or "NONE"))
     print("Relay 1: " .. (config.relay1 and peripheral.getName(config.relay1) or "NONE"))
     print("Relay 2: " .. (config.relay2 and peripheral.getName(config.relay2) or "NONE"))
-    print("Main Modem: " .. (config.mainModemSide or "NONE"))
     print("")
     print("Press Enter to start...")
     read()
@@ -169,7 +146,6 @@ function saveConfig()
         f.writeLine("controlMonitor=" .. (config.controlMonitor and peripheral.getName(config.controlMonitor) or ""))
         f.writeLine("relay1=" .. (config.relay1 and peripheral.getName(config.relay1) or ""))
         f.writeLine("relay2=" .. (config.relay2 and peripheral.getName(config.relay2) or ""))
-        f.writeLine("mainModem=" .. (config.mainModemSide or ""))
         f.close()
     end
 end
@@ -189,17 +165,16 @@ function loadConfig()
             elseif key == "controlMonitor" then config.controlMonitor = peripheral.wrap(val)
             elseif key == "relay1" then config.relay1 = peripheral.wrap(val)
             elseif key == "relay2" then config.relay2 = peripheral.wrap(val)
-            elseif key == "mainModem" then
-                config.mainModemSide = val
-                config.mainModem = peripheral.wrap(val)
             end
         end
     end
     f.close()
     
-    -- Open channel on main modem
-    if config.mainModem then
-        config.mainModem.open(100)
+    -- Open all modems
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            rednet.open(name)
+        end
     end
     
     return true
@@ -467,20 +442,32 @@ function handleKeyboardInput()
 end
 
 -- ============================================
--- KEY PROCESSING - USING modem_message FOR DISTANCE!
+-- KEY PROCESSING - FIXED FOR CC:Tweaked 1.117.1
 -- ============================================
 
-function processPing(message, distance)
+function processPing(sender, message, distance)
     if type(message) ~= "table" then return end
     if message.type ~= "KEY_PING" then return end
     
     local player = message.player
     local keyType = message.keyType or "guest"
     
-    -- CRITICAL FIX: distance is now a REAL NUMBER from modem_message!
-    local dist = tonumber(distance)
+    -- CRITICAL FIX: distance can be number OR nil/string
+    -- In CC:Tweaked 1.117.1, rednet_message sometimes has distance as 4th param
+    -- But sometimes it's the protocol string!
+    
+    local dist = nil
+    
+    if type(distance) == "number" then
+        dist = distance
+    elseif type(distance) == "string" then
+        -- It's probably protocol, ignore
+        print("DEBUG: got protocol instead of distance: " .. distance)
+        return
+    end
+    
     if not dist then
-        print("DEBUG: distance invalid: " .. tostring(distance))
+        print("DEBUG: distance is nil")
         return
     end
     
@@ -502,7 +489,7 @@ function processPing(message, distance)
         end
     end
     
-    -- Distance check - NOW WORKING!
+    -- Distance check
     if dist <= state.radius then
         local now = os.clock()
         state.activePings[player] = {
@@ -523,7 +510,7 @@ end
 -- ============================================
 
 function mainLoop()
-    print("=== Door System v5.0 ===")
+    print("=== Door System v5.1 ===")
     print("CC:Tweaked 1.117.1")
     print("Owner: " .. OWNER_NAME)
     print("Radius: " .. state.radius)
@@ -533,9 +520,8 @@ function mainLoop()
     if config.controlMonitor then print("Control: " .. peripheral.getName(config.controlMonitor)) end
     if config.relay1 then print("Relay 1: " .. peripheral.getName(config.relay1)) end
     if config.relay2 then print("Relay 2: " .. peripheral.getName(config.relay2)) end
-    print("Main Modem: " .. (config.mainModemSide or "NONE"))
     print("")
-    print("Using modem_message for distance")
+    print("Using rednet_message with distance")
     print("")
     
     drawStatusMonitor()
@@ -566,26 +552,19 @@ function mainLoop()
                     drawStatusMonitor()
                     drawControlMonitor()
                     
-                elseif event[1] == "modem_message" then
-                    -- THIS IS THE FIX!
-                    -- modem_message gives us distance!
-                    -- event[1] = "modem_message"
-                    -- event[2] = side (string)
-                    -- event[3] = channel (number)
-                    -- event[4] = replyChannel (number)
-                    -- event[5] = message (table)
-                    -- event[6] = distance (number!)
+                elseif event[1] == "rednet_message" then
+                    -- CC:Tweaked 1.117.1:
+                    -- event[2] = sender (number)
+                    -- event[3] = message (table)
+                    -- event[4] = distance (number) OR protocol (string)
+                    -- event[5] = protocol (string) OR nil
                     
-                    local side = event[2]
-                    local channel = event[3]
-                    local replyChannel = event[4]
-                    local message = event[5]
-                    local distance = event[6]  -- ← REAL DISTANCE!
+                    local sender = event[2]
+                    local message = event[3]
+                    local distance = event[4]
+                    local protocol = event[5]
                     
-                    -- Only process messages on our channel from main modem
-                    if side == config.mainModemSide and channel == 100 then
-                        processPing(message, distance)
-                    end
+                    processPing(sender, message, distance)
                     
                 elseif event[1] == "monitor_touch" then
                     local monName = event[2]
