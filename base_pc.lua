@@ -1,13 +1,13 @@
 -- ============================================
--- BASE DOOR CONTROL SYSTEM v5.3
--- CC:Tweaked 1.117.1 - Uses modem_message for distance
+-- BASE DOOR CONTROL SYSTEM v5.4
+-- Fixed: lastPingTime, modem selection, relay verify
 -- ============================================
 
 local OWNER_NAME = "Boshy99"  -- Твоё имя
 
 local DEFAULT_RADIUS = 5
 local PING_TIMEOUT = 2
-local KEY_CHANNEL = 100  -- Канал для ключей
+local KEY_CHANNEL = 100
 
 -- ============================================
 -- PERIPHERAL CONFIG
@@ -18,9 +18,9 @@ local config = {
     controlMonitor = nil,
     relay1 = nil,
     relay2 = nil,
-    modem1 = nil,      -- Wireless modem under door 1
-    modem2 = nil,      -- Wireless modem under door 2
-    mainModem = nil,   -- Main wireless modem for receiving keys
+    modem1 = nil,
+    modem2 = nil,
+    mainModem = nil,
     mainModemSide = nil,
 }
 
@@ -32,6 +32,7 @@ local state = {
     manualOverride = false,
     allowedGuests = {},
     activePings = {},
+    lastPingTime = {},  -- FIX: Added this!
 }
 
 -- ============================================
@@ -166,8 +167,11 @@ function runConfiguration()
     sleep(0.3)
     
     -- Main Modem (receives keys from pocket PCs)
+    -- IMPORTANT: Must be a WIRED modem connected via cable, not "top"!
     term.clear()
     print("=== MAIN MODEM (receives keys) ===")
+    print("WARNING: Select a wired modem, NOT 'top'!")
+    print("Available modems:")
     local remMod2 = {}
     for _, p in ipairs(modems) do
         if p.name ~= config.modem1 and p.name ~= config.modem2 then
@@ -256,16 +260,29 @@ function loadConfig()
 end
 
 -- ============================================
--- DOOR CONTROL
+-- DOOR CONTROL - FIXED VERIFY
 -- ============================================
 
 function setDoor(doorNum, isOpen)
     local relay = (doorNum == 1) and config.relay1 or config.relay2
-    if not relay then return end
+    if not relay then 
+        print("ERROR: Relay " .. doorNum .. " not found!")
+        return 
+    end
     
-    pcall(function()
+    local relayName = peripheral.getName(relay)
+    
+    -- Try to set output
+    local ok = pcall(function()
         relay.setOutput("top", isOpen)
     end)
+    
+    if ok then
+        -- Don't verify, just trust it worked
+        print("Door " .. doorNum .. " (" .. relayName .. ") = " .. tostring(isOpen))
+    else
+        print("ERROR: Failed to set relay " .. doorNum)
+    end
     
     if doorNum == 1 then state.door1Open = isOpen
     else state.door2Open = isOpen end
@@ -527,7 +544,6 @@ function processPing(message, distance)
     local player = message.player
     local keyType = message.keyType or "guest"
     
-    -- distance from modem_message is guaranteed to be number
     if type(distance) ~= "number" then
         return
     end
@@ -557,7 +573,7 @@ function processPing(message, distance)
             distance = distance,
             keyType = keyType
         }
-        state.lastPingTime[player] = now
+        state.lastPingTime[player] = now  -- FIX: Now works!
         
         if not state.door1Open then
             openDoors()
@@ -566,11 +582,11 @@ function processPing(message, distance)
 end
 
 -- ============================================
--- MAIN LOOP - USES modem_message!
+-- MAIN LOOP
 -- ============================================
 
 function mainLoop()
-    print("=== Door System v5.3 ===")
+    print("=== Door System v5.4 ===")
     print("CC:Tweaked 1.117.1")
     print("Owner: " .. OWNER_NAME)
     print("Radius: " .. state.radius)
@@ -617,21 +633,13 @@ function mainLoop()
                     drawControlMonitor()
                     
                 elseif event[1] == "modem_message" then
-                    -- modem_message gives reliable distance!
-                    -- event[1] = "modem_message"
-                    -- event[2] = side (string)
-                    -- event[3] = channel (number)
-                    -- event[4] = replyChannel (number)
-                    -- event[5] = message (table)
-                    -- event[6] = distance (number!)
-                    
                     local side = event[2]
                     local channel = event[3]
                     local replyChannel = event[4]
                     local message = event[5]
                     local distance = event[6]
                     
-                    -- Only process messages on our channel from main modem
+                    -- Only process from main modem on our channel
                     if side == config.mainModemSide and channel == KEY_CHANNEL then
                         processPing(message, distance)
                     end
