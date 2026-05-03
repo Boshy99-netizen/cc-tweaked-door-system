@@ -1,6 +1,7 @@
 -- ============================================
--- BASE DOOR CONTROL SYSTEM v7.0
--- 2 modems only (1 per door), individual control
+-- BASE DOOR CONTROL SYSTEM v8.0 FINAL
+-- CC:Tweaked 1.117.1
+-- No flicker, redraw only on state change
 -- ============================================
 
 local OWNER_NAME = "Boshy99"
@@ -18,10 +19,11 @@ local config = {
     controlMonitor = nil,
     relay1 = nil,
     relay2 = nil,
-    modem1 = nil,      -- Under door 1
-    modem2 = nil,      -- Under door 2
+    modem1 = nil,
+    modem2 = nil,
 }
 
+-- State
 local state = {
     locked = false,
     radius = DEFAULT_RADIUS,
@@ -33,6 +35,10 @@ local state = {
     activePings = {},
     lastPingTime = {},
 }
+
+-- Previous state for detecting changes (prevents flicker)
+local prevStatusState = nil
+local prevControlState = nil
 
 -- ============================================
 -- CONFIGURATION
@@ -133,7 +139,7 @@ function runConfiguration()
     end
     sleep(0.3)
     
-    -- Modem 1 (under Door 1)
+    -- Modem 1
     term.clear()
     print("=== MODEM 1 (Under Door 1) ===")
     for i, p in ipairs(modems) do
@@ -150,7 +156,7 @@ function runConfiguration()
     end
     sleep(0.3)
     
-    -- Modem 2 (under Door 2)
+    -- Modem 2
     term.clear()
     print("=== MODEM 2 (Under Door 2) ===")
     local remMod = {}
@@ -247,35 +253,33 @@ function setDoor(doorNum, isOpen)
 end
 
 -- ============================================
--- STATUS MONITOR (OUTSIDE) - BEAUTIFUL FRAME
+-- STATUS MONITOR (OUTSIDE) - NO FLICKER
 -- ============================================
+
+function getStatusStateString()
+    return tostring(state.locked)
+end
 
 function drawStatusMonitor()
     local mon = config.statusMonitor
     if not mon then return end
     
-    mon.setTextScale(0.8)
+    -- Only redraw if state changed
+    local currentState = getStatusStateString()
+    if currentState == prevStatusState then
+        return
+    end
+    prevStatusState = currentState
+    
+    mon.setTextScale(1.5)
     mon.setBackgroundColor(colors.black)
     mon.clear()
     
     local w, h = mon.getSize()
     
-    -- Draw frame border
+    -- Draw beautiful double frame
     mon.setTextColor(colors.gray)
-    -- Top and bottom borders
-    for x = 1, w do
-        mon.setCursorPos(x, 1)
-        mon.write("-")
-        mon.setCursorPos(x, h)
-        mon.write("-")
-    end
-    -- Side borders
-    for y = 2, h - 1 do
-        mon.setCursorPos(1, y)
-        mon.write("|")
-        mon.setCursorPos(w, y)
-        mon.write("|")
-    end
+    
     -- Corners
     mon.setCursorPos(1, 1)
     mon.write("+")
@@ -286,6 +290,22 @@ function drawStatusMonitor()
     mon.setCursorPos(w, h)
     mon.write("+")
     
+    -- Horizontal borders
+    for x = 2, w - 1 do
+        mon.setCursorPos(x, 1)
+        mon.write("=")
+        mon.setCursorPos(x, h)
+        mon.write("=")
+    end
+    
+    -- Vertical borders
+    for y = 2, h - 1 do
+        mon.setCursorPos(1, y)
+        mon.write("|")
+        mon.setCursorPos(w, y)
+        mon.write("|")
+    end
+    
     -- Calculate center positions
     local line1 = "==Base " .. OWNER_NAME .. "=="
     local line2 = "Base Status"
@@ -295,17 +315,17 @@ function drawStatusMonitor()
     local x2 = math.floor((w - #line2) / 2) + 1
     local x3 = math.floor((w - #line3) / 2) + 1
     
-    -- Line 1: ==Base Boshy99==
+    -- Line 1
     mon.setTextColor(colors.white)
     mon.setCursorPos(x1, 3)
     mon.write(line1)
     
-    -- Line 2: Base Status
+    -- Line 2
     mon.setTextColor(colors.lightGray)
     mon.setCursorPos(x2, 5)
     mon.write(line2)
     
-    -- Line 3: OPEN or LOCKED
+    -- Line 3
     mon.setCursorPos(x3, 7)
     if state.locked then
         mon.setTextColor(colors.red)
@@ -316,26 +336,42 @@ function drawStatusMonitor()
 end
 
 -- ============================================
--- CONTROL MONITOR (INSIDE) - BEAUTIFUL
+-- CONTROL MONITOR (INSIDE) - NO FLICKER
 -- ============================================
 
 local buttons = {}
 local inputMode = nil
 local inputBuffer = ""
 
+function getControlStateString()
+    local guests = {}
+    for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
+    table.sort(guests)
+    return tostring(state.locked) .. "|" .. tostring(state.door1Open) .. "|" .. tostring(state.door2Open) .. "|" .. state.radius .. "|" .. table.concat(guests, ",") .. "|" .. tostring(inputMode) .. "|" .. inputBuffer
+end
+
 function drawControlMonitor()
     local mon = config.controlMonitor
     if not mon then return end
+    
+    -- Only redraw if state changed
+    local currentState = getControlStateString()
+    if currentState == prevControlState then
+        return
+    end
+    prevControlState = currentState
     
     buttons = {}
     mon.setTextScale(0.8)
     mon.setBackgroundColor(colors.black)
     mon.clear()
     
-    -- Header with border
+    local w, h = mon.getSize()
+    
+    -- Header with background
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.white)
-    for x = 1, 26 do
+    for x = 1, w do
         mon.setCursorPos(x, 1)
         mon.write(" ")
     end
@@ -348,14 +384,14 @@ function drawControlMonitor()
     mon.setCursorPos(2, 3)
     mon.write("Owner: " .. OWNER_NAME)
     
-    -- Lock status
+    -- Lock button
     if state.locked then
         drawBtn(mon, 2, 5, " [ UNLOCK BASE ] ", colors.red, colors.white, "toggle_lock")
     else
         drawBtn(mon, 2, 5, " [  LOCK BASE  ] ", colors.lime, colors.black, "toggle_lock")
     end
     
-    -- Door 1 controls
+    -- Door 1
     mon.setTextColor(colors.white)
     mon.setCursorPos(2, 8)
     mon.write("DOOR 1:")
@@ -365,7 +401,7 @@ function drawControlMonitor()
         drawBtn(mon, 12, 8, "[OPEN] ", colors.green, colors.white, "toggle_door1")
     end
     
-    -- Door 2 controls
+    -- Door 2
     mon.setTextColor(colors.white)
     mon.setCursorPos(2, 10)
     mon.write("DOOR 2:")
@@ -375,7 +411,7 @@ function drawControlMonitor()
         drawBtn(mon, 12, 10, "[OPEN] ", colors.green, colors.white, "toggle_door2")
     end
     
-    -- Radius control
+    -- Radius
     mon.setTextColor(colors.white)
     mon.setCursorPos(2, 13)
     mon.write("Radius:")
@@ -385,10 +421,10 @@ function drawControlMonitor()
     mon.write(string.format("%2d", state.radius))
     drawBtn(mon, 19, 13, " + ", colors.gray, colors.white, "radius_up")
     
-    -- Guest list header
+    -- Guest header
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.white)
-    for x = 1, 26 do
+    for x = 1, w do
         mon.setCursorPos(x, 15)
         mon.write(" ")
     end
@@ -403,6 +439,7 @@ function drawControlMonitor()
     local y = 17
     local guests = {}
     for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
+    table.sort(guests)
     
     for i = 1, math.min(#guests, 5) do
         mon.setTextColor(colors.yellow)
@@ -421,10 +458,10 @@ function drawControlMonitor()
     
     -- Input overlay
     if inputMode == "add_guest" then
-        -- Draw box
-        mon.setBackgroundColor(colors.black)
+        -- Box background
         for by = 10, 18 do
             for bx = 4, 22 do
+                mon.setBackgroundColor(colors.black)
                 mon.setCursorPos(bx, by)
                 mon.write(" ")
             end
@@ -473,10 +510,10 @@ end
 
 function handleTouch(mx, my)
     if inputMode == "add_guest" then
-        -- Click outside box cancels
         if mx < 4 or mx > 22 or my < 10 or my > 18 then
             inputMode = nil
             inputBuffer = ""
+            prevControlState = nil  -- Force redraw
             drawControlMonitor()
         end
         return
@@ -510,6 +547,7 @@ function execAction(action)
     elseif action == "add_guest" then
         inputMode = "add_guest"
         inputBuffer = ""
+        prevControlState = nil  -- Force redraw
         drawControlMonitor()
         return
     elseif action:sub(1, 7) == "remove_" then
@@ -520,6 +558,9 @@ function execAction(action)
         os.reboot()
     end
     
+    -- Force redraw after action
+    prevControlState = nil
+    prevStatusState = nil
     drawControlMonitor()
     drawStatusMonitor()
 end
@@ -536,27 +577,32 @@ function handleKeyboardInput()
                 end
                 inputMode = nil
                 inputBuffer = ""
+                prevControlState = nil  -- Force redraw
                 drawControlMonitor()
                 drawStatusMonitor()
             elseif key == keys.backspace then
                 if #inputBuffer > 0 then
                     inputBuffer = inputBuffer:sub(1, -2)
+                    prevControlState = nil
                     drawControlMonitor()
                 end
-            -- FIX: Support uppercase letters!
             elseif key >= keys.a and key <= keys.z then
                 local char = string.char(key - keys.a + string.byte("a"))
                 inputBuffer = inputBuffer .. char
+                prevControlState = nil
                 drawControlMonitor()
             elseif key >= keys.zero and key <= keys.nine then
                 local char = string.char(key - keys.zero + string.byte("0"))
                 inputBuffer = inputBuffer .. char
+                prevControlState = nil
                 drawControlMonitor()
             elseif key == keys.space then
                 inputBuffer = inputBuffer .. " "
+                prevControlState = nil
                 drawControlMonitor()
             elseif key == keys.minus or key == keys.underscore then
                 inputBuffer = inputBuffer .. "_"
+                prevControlState = nil
                 drawControlMonitor()
             end
         end
@@ -564,7 +610,7 @@ function handleKeyboardInput()
 end
 
 -- ============================================
--- KEY PROCESSING - PER DOOR
+-- KEY PROCESSING
 -- ============================================
 
 function processPing(message, distance, modemSide)
@@ -578,25 +624,21 @@ function processPing(message, distance, modemSide)
         return
     end
     
-    -- Determine which door based on which modem received
     local targetDoor = nil
-    
     if modemSide == config.modem1 then
         targetDoor = 1
     elseif modemSide == config.modem2 then
         targetDoor = 2
     else
-        return  -- Unknown modem
+        return
     end
     
-    -- Check lock
     if state.locked then
         if player ~= OWNER_NAME or keyType ~= "owner" then
             return
         end
     end
     
-    -- Check permissions
     if keyType == "owner" then
         if player ~= OWNER_NAME then return end
     else
@@ -616,7 +658,6 @@ function processPing(message, distance, modemSide)
         }
         state.lastPingTime[player] = now
         
-        -- Open only the specific door
         if targetDoor == 1 then
             setDoor(1, true)
         elseif targetDoor == 2 then
@@ -630,7 +671,7 @@ end
 -- ============================================
 
 function mainLoop()
-    print("=== Door System v7.0 ===")
+    print("=== Door System v8.0 ===")
     print("Owner: " .. OWNER_NAME)
     print("Radius: " .. state.radius)
     print("")
@@ -643,6 +684,9 @@ function mainLoop()
     print("Modem Door 2: " .. (config.modem2 or "NONE"))
     print("")
     
+    -- Initial draw
+    prevStatusState = nil
+    prevControlState = nil
     drawStatusMonitor()
     drawControlMonitor()
     
@@ -666,16 +710,25 @@ function mainLoop()
                         end
                     end
                     
-                    -- Auto-close doors if no active pings
-                    if not door1Active and not state.manualOverride1 then
+                    local door1Changed = false
+                    local door2Changed = false
+                    
+                    if not door1Active and not state.manualOverride1 and state.door1Open then
                         setDoor(1, false)
+                        door1Changed = true
                     end
-                    if not door2Active and not state.manualOverride2 then
+                    if not door2Active and not state.manualOverride2 and state.door2Open then
                         setDoor(2, false)
+                        door2Changed = true
                     end
                     
-                    drawStatusMonitor()
-                    drawControlMonitor()
+                    -- Only redraw if something changed
+                    if door1Changed or door2Changed then
+                        prevStatusState = nil
+                        prevControlState = nil
+                        drawStatusMonitor()
+                        drawControlMonitor()
+                    end
                     
                 elseif event[1] == "modem_message" then
                     local side = event[2]
@@ -684,10 +737,14 @@ function mainLoop()
                     local message = event[5]
                     local distance = event[6]
                     
-                    -- Only process from our door modems on our channel
                     if channel == KEY_CHANNEL then
                         if side == config.modem1 or side == config.modem2 then
                             processPing(message, distance, side)
+                            -- Force redraw after ping processed
+                            prevStatusState = nil
+                            prevControlState = nil
+                            drawStatusMonitor()
+                            drawControlMonitor()
                         end
                     end
                     
