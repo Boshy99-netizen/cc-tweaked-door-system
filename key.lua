@@ -1,9 +1,9 @@
 -- ============================================
--- OWNER KEY v5.0
--- Uses modem API (not rednet) for compatibility
+-- OWNER KEY v6.0
 -- ============================================
 
 local INTERVAL = 1
+local KEY_CHANNEL = 100
 
 local playerName = settings.get("key_owner")
 if not playerName then
@@ -25,15 +25,14 @@ if not modem then
 end
 
 local modemName = peripheral.getName(modem)
-modem.open(101)  -- Open reply channel
+modem.open(KEY_CHANNEL + 1)
 
 print("Modem: " .. modemName)
-print("Sending on channel 100...")
+print("Sending on channel " .. KEY_CHANNEL .. "...")
 print("")
 
 while true do
-    -- Use modem.transmit instead of rednet
-    modem.transmit(100, 101, {
+    modem.transmit(KEY_CHANNEL, KEY_CHANNEL + 1, {
         type = "KEY_PING",
         keyType = "owner",
         player = playerName,
