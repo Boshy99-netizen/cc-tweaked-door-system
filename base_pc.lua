@@ -1,6 +1,6 @@
 -- ============================================
--- BASE DOOR CONTROL SYSTEM v5.1
--- CC:Tweaked 1.117.1 - Fixed distance handling
+-- BASE DOOR CONTROL SYSTEM v5.2
+-- CC:Tweaked 1.117.1 - With modem selection
 -- ============================================
 
 local OWNER_NAME = "Boshy99"  -- CHANGE THIS!
@@ -16,6 +16,9 @@ local config = {
     controlMonitor = nil,
     relay1 = nil,
     relay2 = nil,
+    modem1 = nil,      -- Wireless modem under door 1
+    modem2 = nil,      -- Wireless modem under door 2
+    mainModem = nil,   -- Main wireless modem on PC for receiving keys
 }
 
 local state = {
@@ -40,6 +43,7 @@ function runConfiguration()
     
     local monitors = {}
     local relays = {}
+    local modems = {}
     
     for _, name in ipairs(peripheral.getNames()) do
         local pType = peripheral.getType(name)
@@ -47,15 +51,23 @@ function runConfiguration()
         
         if pType == "monitor" then table.insert(monitors, p)
         elseif pType == "redstone_relay" then table.insert(relays, p)
+        elseif pType == "modem" then table.insert(modems, p)
         end
     end
     
     print("=== ALL PERIPHERALS ===")
-    for i, p in ipairs(monitors) do
-        print(i .. ". " .. p.name .. " (" .. p.type .. ")")
+    local idx = 1
+    for _, p in ipairs(monitors) do
+        print(idx .. ". " .. p.name .. " (" .. p.type .. ")")
+        idx = idx + 1
     end
-    for i, p in ipairs(relays) do
-        print((#monitors + i) .. ". " .. p.name .. " (" .. p.type .. ")")
+    for _, p in ipairs(relays) do
+        print(idx .. ". " .. p.name .. " (" .. p.type .. ")")
+        idx = idx + 1
+    end
+    for _, p in ipairs(modems) do
+        print(idx .. ". " .. p.name .. " (" .. p.type .. ")")
+        idx = idx + 1
     end
     print("")
     
@@ -65,8 +77,8 @@ function runConfiguration()
     print("Select number:")
     local choice = read()
     if choice ~= "" then
-        local idx = tonumber(choice)
-        if idx and monitors[idx] then config.statusMonitor = monitors[idx].obj end
+        local n = tonumber(choice)
+        if n and monitors[n] then config.statusMonitor = monitors[n].obj end
     end
     sleep(0.3)
     
@@ -83,26 +95,26 @@ function runConfiguration()
     print("Select number:")
     choice = read()
     if choice ~= "" then
-        local idx = tonumber(choice)
-        if idx and remMon[idx] then config.controlMonitor = remMon[idx].obj end
+        local n = tonumber(choice)
+        if n and remMon[n] then config.controlMonitor = remMon[n].obj end
     end
     sleep(0.3)
     
     -- Relay 1
     term.clear()
-    print("=== RELAY 1 (Door 1) ===")
+    print("=== RELAY 1 (Door 1 / Left) ===")
     for i, p in ipairs(relays) do print("  " .. i .. ". " .. p.name) end
     print("Select number:")
     choice = read()
     if choice ~= "" then
-        local idx = tonumber(choice)
-        if idx and relays[idx] then config.relay1 = relays[idx].obj end
+        local n = tonumber(choice)
+        if n and relays[n] then config.relay1 = relays[n].obj end
     end
     sleep(0.3)
     
     -- Relay 2
     term.clear()
-    print("=== RELAY 2 (Door 2) ===")
+    print("=== RELAY 2 (Door 2 / Right) ===")
     local remRel = {}
     for _, p in ipairs(relays) do
         if p.obj ~= config.relay1 then
@@ -113,27 +125,78 @@ function runConfiguration()
     print("Select number:")
     choice = read()
     if choice ~= "" then
-        local idx = tonumber(choice)
-        if idx and remRel[idx] then config.relay2 = remRel[idx].obj end
+        local n = tonumber(choice)
+        if n and remRel[n] then config.relay2 = remRel[n].obj end
     end
     sleep(0.3)
     
-    -- Open all modems automatically
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "modem" then
-            rednet.open(name)
-            print("Opened modem: " .. name)
+    -- Modem 1 (under Door 1)
+    term.clear()
+    print("=== MODEM 1 (Wireless under Door 1) ===")
+    for i, p in ipairs(modems) do
+        print("  " .. i .. ". " .. p.name)
+    end
+    print("Select number:")
+    choice = read()
+    if choice ~= "" then
+        local n = tonumber(choice)
+        if n and modems[n] then config.modem1 = modems[n].name end
+    end
+    sleep(0.3)
+    
+    -- Modem 2 (under Door 2)
+    term.clear()
+    print("=== MODEM 2 (Wireless under Door 2) ===")
+    local remMod = {}
+    for _, p in ipairs(modems) do
+        if p.name ~= config.modem1 then
+            table.insert(remMod, p)
+            print("  " .. #remMod .. ". " .. p.name)
         end
+    end
+    print("Select number:")
+    choice = read()
+    if choice ~= "" then
+        local n = tonumber(choice)
+        if n and remMod[n] then config.modem2 = remMod[n].name end
+    end
+    sleep(0.3)
+    
+    -- Main Modem (receives keys from pocket PCs)
+    term.clear()
+    print("=== MAIN MODEM (receives keys) ===")
+    local remMod2 = {}
+    for _, p in ipairs(modems) do
+        if p.name ~= config.modem1 and p.name ~= config.modem2 then
+            table.insert(remMod2, p)
+            print("  " .. #remMod2 .. ". " .. p.name)
+        end
+    end
+    print("Select number:")
+    choice = read()
+    if choice ~= "" then
+        local n = tonumber(choice)
+        if n and remMod2[n] then config.mainModem = remMod2[n].name end
+    end
+    sleep(0.3)
+    
+    -- Open all modems for rednet
+    for _, p in ipairs(modems) do
+        rednet.open(p.name)
+        print("Opened modem: " .. p.name)
     end
     
     saveConfig()
     
     term.clear()
-    print("=== CONFIG COMPLETE ===")
-    print("Status:  " .. (config.statusMonitor and peripheral.getName(config.statusMonitor) or "NONE"))
-    print("Control: " .. (config.controlMonitor and peripheral.getName(config.controlMonitor) or "NONE"))
-    print("Relay 1: " .. (config.relay1 and peripheral.getName(config.relay1) or "NONE"))
-    print("Relay 2: " .. (config.relay2 and peripheral.getName(config.relay2) or "NONE"))
+    print("=== CONFIGURATION COMPLETE ===")
+    print("Status Monitor:  " .. (config.statusMonitor and peripheral.getName(config.statusMonitor) or "NONE"))
+    print("Control Monitor: " .. (config.controlMonitor and peripheral.getName(config.controlMonitor) or "NONE"))
+    print("Relay 1:         " .. (config.relay1 and peripheral.getName(config.relay1) or "NONE"))
+    print("Relay 2:         " .. (config.relay2 and peripheral.getName(config.relay2) or "NONE"))
+    print("Modem Door 1:    " .. (config.modem1 or "NONE"))
+    print("Modem Door 2:    " .. (config.modem2 or "NONE"))
+    print("Main Modem:      " .. (config.mainModem or "NONE"))
     print("")
     print("Press Enter to start...")
     read()
@@ -146,6 +209,9 @@ function saveConfig()
         f.writeLine("controlMonitor=" .. (config.controlMonitor and peripheral.getName(config.controlMonitor) or ""))
         f.writeLine("relay1=" .. (config.relay1 and peripheral.getName(config.relay1) or ""))
         f.writeLine("relay2=" .. (config.relay2 and peripheral.getName(config.relay2) or ""))
+        f.writeLine("modem1=" .. (config.modem1 or ""))
+        f.writeLine("modem2=" .. (config.modem2 or ""))
+        f.writeLine("mainModem=" .. (config.mainModem or ""))
         f.close()
     end
 end
@@ -165,6 +231,9 @@ function loadConfig()
             elseif key == "controlMonitor" then config.controlMonitor = peripheral.wrap(val)
             elseif key == "relay1" then config.relay1 = peripheral.wrap(val)
             elseif key == "relay2" then config.relay2 = peripheral.wrap(val)
+            elseif key == "modem1" then config.modem1 = val
+            elseif key == "modem2" then config.modem2 = val
+            elseif key == "mainModem" then config.mainModem = val
             end
         end
     end
@@ -442,7 +511,7 @@ function handleKeyboardInput()
 end
 
 -- ============================================
--- KEY PROCESSING - FIXED FOR CC:Tweaked 1.117.1
+-- KEY PROCESSING
 -- ============================================
 
 function processPing(sender, message, distance)
@@ -452,26 +521,9 @@ function processPing(sender, message, distance)
     local player = message.player
     local keyType = message.keyType or "guest"
     
-    -- CRITICAL FIX: distance can be number OR nil/string
-    -- In CC:Tweaked 1.117.1, rednet_message sometimes has distance as 4th param
-    -- But sometimes it's the protocol string!
-    
-    local dist = nil
-    
-    if type(distance) == "number" then
-        dist = distance
-    elseif type(distance) == "string" then
-        -- It's probably protocol, ignore
-        print("DEBUG: got protocol instead of distance: " .. distance)
+    if type(distance) ~= "number" then
         return
     end
-    
-    if not dist then
-        print("DEBUG: distance is nil")
-        return
-    end
-    
-    print("DEBUG: " .. player .. " at " .. dist .. " blocks")
     
     -- Check lock
     if state.locked then
@@ -489,12 +541,11 @@ function processPing(sender, message, distance)
         end
     end
     
-    -- Distance check
-    if dist <= state.radius then
+    if distance <= state.radius then
         local now = os.clock()
         state.activePings[player] = {
             time = now,
-            distance = dist,
+            distance = distance,
             keyType = keyType
         }
         state.lastPingTime[player] = now
@@ -510,7 +561,7 @@ end
 -- ============================================
 
 function mainLoop()
-    print("=== Door System v5.1 ===")
+    print("=== Door System v5.2 ===")
     print("CC:Tweaked 1.117.1")
     print("Owner: " .. OWNER_NAME)
     print("Radius: " .. state.radius)
@@ -520,8 +571,9 @@ function mainLoop()
     if config.controlMonitor then print("Control: " .. peripheral.getName(config.controlMonitor)) end
     if config.relay1 then print("Relay 1: " .. peripheral.getName(config.relay1)) end
     if config.relay2 then print("Relay 2: " .. peripheral.getName(config.relay2)) end
-    print("")
-    print("Using rednet_message with distance")
+    print("Modem Door 1: " .. (config.modem1 or "NONE"))
+    print("Modem Door 2: " .. (config.modem2 or "NONE"))
+    print("Main Modem:   " .. (config.mainModem or "NONE"))
     print("")
     
     drawStatusMonitor()
@@ -553,16 +605,9 @@ function mainLoop()
                     drawControlMonitor()
                     
                 elseif event[1] == "rednet_message" then
-                    -- CC:Tweaked 1.117.1:
-                    -- event[2] = sender (number)
-                    -- event[3] = message (table)
-                    -- event[4] = distance (number) OR protocol (string)
-                    -- event[5] = protocol (string) OR nil
-                    
                     local sender = event[2]
                     local message = event[3]
                     local distance = event[4]
-                    local protocol = event[5]
                     
                     processPing(sender, message, distance)
                     
