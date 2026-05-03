@@ -1,7 +1,6 @@
 -- ============================================
--- BASE DOOR CONTROL SYSTEM v8.0 FINAL
--- CC:Tweaked 1.117.1
--- No flicker, redraw only on state change
+-- BASE DOOR CONTROL SYSTEM v9.0
+-- Individual radius per door, persistent guests
 -- ============================================
 
 local OWNER_NAME = "Boshy99"
@@ -23,31 +22,97 @@ local config = {
     modem2 = nil,
 }
 
--- State
+-- ============================================
+-- STATE
+-- ============================================
+
 local state = {
     locked = false,
-    radius = DEFAULT_RADIUS,
+    radius1 = DEFAULT_RADIUS,  -- Radius for door 1
+    radius2 = DEFAULT_RADIUS,  -- Radius for door 2
     door1Open = false,
     door2Open = false,
     manualOverride1 = false,
     manualOverride2 = false,
-    allowedGuests = {},
+    allowedGuests = {},        -- Will be loaded from file
     activePings = {},
     lastPingTime = {},
 }
 
--- Previous state for detecting changes (prevents flicker)
+-- Previous state for no-flicker
 local prevStatusState = nil
 local prevControlState = nil
 
 -- ============================================
--- CONFIGURATION
+-- SAVE/LOAD PERSISTENT DATA
+-- ============================================
+
+function savePersistentData()
+    -- Save guests
+    local f = fs.open("guests.txt", "w")
+    if f then
+        for name, _ in pairs(state.allowedGuests) do
+            f.writeLine(name)
+        end
+        f.close()
+    end
+    
+    -- Save radii
+    local r = fs.open("radii.txt", "w")
+    if r then
+        r.writeLine("radius1=" .. state.radius1)
+        r.writeLine("radius2=" .. state.radius2)
+        r.close()
+    end
+end
+
+function loadPersistentData()
+    -- Load guests
+    if fs.exists("guests.txt") then
+        local f = fs.open("guests.txt", "r")
+        if f then
+            while true do
+                local line = f.readLine()
+                if not line then break end
+                if line ~= "" then
+                    state.allowedGuests[line] = true
+                end
+            end
+            f.close()
+        end
+    end
+    
+    -- Load radii
+    if fs.exists("radii.txt") then
+        local r = fs.open("radii.txt", "r")
+        if r then
+            while true do
+                local line = r.readLine()
+                if not line then break end
+                local key, val = line:match("([^=]+)=(.*)")
+                if key and val then
+                    local num = tonumber(val)
+                    if num then
+                        if key == "radius1" then state.radius1 = num
+                        elseif key == "radius2" then state.radius2 = num
+                        end
+                    end
+                end
+            end
+            r.close()
+        end
+    end
+end
+
+-- ============================================
+-- CONFIGURATION (peripherals only)
 -- ============================================
 
 function runConfiguration()
     term.clear()
     term.setCursorPos(1, 1)
     print("=== DOOR SYSTEM SETUP ===")
+    print("Configure peripherals. Radii and guests are saved separately.")
     print("")
     
     local monitors = {}
@@ -264,7 +329,6 @@ function drawStatusMonitor()
     local mon = config.statusMonitor
     if not mon then return end
     
-    -- Only redraw if state changed
     local currentState = getStatusStateString()
     if currentState == prevStatusState then
         return
@@ -277,7 +341,7 @@ function drawStatusMonitor()
     
     local w, h = mon.getSize()
     
-    -- Draw beautiful double frame
+    -- Draw beautiful frame
     mon.setTextColor(colors.gray)
     
     -- Corners
@@ -347,14 +411,13 @@ function getControlStateString()
     local guests = {}
     for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
     table.sort(guests)
-    return tostring(state.locked) .. "|" .. tostring(state.door1Open) .. "|" .. tostring(state.door2Open) .. "|" .. state.radius .. "|" .. table.concat(guests, ",") .. "|" .. tostring(inputMode) .. "|" .. inputBuffer
+    return tostring(state.locked) .. "|" .. tostring(state.door1Open) .. "|" .. tostring(state.door2Open) .. "|" .. state.radius1 .. "|" .. state.radius2 .. "|" .. table.concat(guests, ",") .. "|" .. tostring(inputMode) .. "|" .. inputBuffer
 end
 
 function drawControlMonitor()
     local mon = config.controlMonitor
     if not mon then return end
     
-    -- Only redraw if state changed
     local currentState = getControlStateString()
     if currentState == prevControlState then
         return
@@ -368,7 +431,7 @@ function drawControlMonitor()
     
     local w, h = mon.getSize()
     
-    -- Header with background
+    -- Header
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.white)
     for x = 1, w do
@@ -391,7 +454,7 @@ function drawControlMonitor()
         drawBtn(mon, 2, 5, " [  LOCK BASE  ] ", colors.lime, colors.black, "toggle_lock")
     end
     
-    -- Door 1
+    -- Door 1 controls
     mon.setTextColor(colors.white)
     mon.setCursorPos(2, 8)
     mon.write("DOOR 1:")
@@ -401,42 +464,52 @@ function drawControlMonitor()
         drawBtn(mon, 12, 8, "[OPEN] ", colors.green, colors.white, "toggle_door1")
     end
     
-    -- Door 2
+    -- Door 1 radius
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(2, 9)
+    mon.write("Radius1:")
+    drawBtn(mon, 11, 9, "-", colors.gray, colors.white, "radius1_down")
+    mon.setTextColor(colors.yellow)
+    mon.setCursorPos(14, 9)
+    mon.write(string.format("%2d", state.radius1))
+    drawBtn(mon, 18, 9, "+", colors.gray, colors.white, "radius1_up")
+    
+    -- Door 2 controls
     mon.setTextColor(colors.white)
-    mon.setCursorPos(2, 10)
+    mon.setCursorPos(2, 11)
     mon.write("DOOR 2:")
     if state.door2Open then
-        drawBtn(mon, 12, 10, "[CLOSE]", colors.yellow, colors.black, "toggle_door2")
+        drawBtn(mon, 12, 11, "[CLOSE]", colors.yellow, colors.black, "toggle_door2")
     else
-        drawBtn(mon, 12, 10, "[OPEN] ", colors.green, colors.white, "toggle_door2")
+        drawBtn(mon, 12, 11, "[OPEN] ", colors.green, colors.white, "toggle_door2")
     end
     
-    -- Radius
-    mon.setTextColor(colors.white)
-    mon.setCursorPos(2, 13)
-    mon.write("Radius:")
-    drawBtn(mon, 10, 13, " - ", colors.gray, colors.white, "radius_down")
+    -- Door 2 radius
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(2, 12)
+    mon.write("Radius2:")
+    drawBtn(mon, 11, 12, "-", colors.gray, colors.white, "radius2_down")
     mon.setTextColor(colors.yellow)
-    mon.setCursorPos(15, 13)
-    mon.write(string.format("%2d", state.radius))
-    drawBtn(mon, 19, 13, " + ", colors.gray, colors.white, "radius_up")
+    mon.setCursorPos(14, 12)
+    mon.write(string.format("%2d", state.radius2))
+    drawBtn(mon, 18, 12, "+", colors.gray, colors.white, "radius2_up")
     
     -- Guest header
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.white)
     for x = 1, w do
-        mon.setCursorPos(x, 15)
+        mon.setCursorPos(x, 14)
         mon.write(" ")
     end
     local guestCount = 0
     for _ in pairs(state.allowedGuests) do guestCount = guestCount + 1 end
-    mon.setCursorPos(2, 15)
+    mon.setCursorPos(2, 14)
     mon.write(" GUESTS: " .. guestCount .. " ")
-    drawBtn(mon, 20, 15, " +ADD ", colors.green, colors.white, "add_guest")
+    drawBtn(mon, 20, 14, " +ADD ", colors.green, colors.white, "add_guest")
     mon.setBackgroundColor(colors.black)
     
     -- Guest list
-    local y = 17
+    local y = 16
     local guests = {}
     for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
     table.sort(guests)
@@ -451,14 +524,13 @@ function drawControlMonitor()
     
     -- Footer
     mon.setTextColor(colors.gray)
-    mon.setCursorPos(2, 23)
+    mon.setCursorPos(2, 22)
     mon.write("Active: " .. countPings())
     
-    drawBtn(mon, 2, 24, "[ RECONFIGURE ]", colors.purple, colors.white, "reconfig")
+    drawBtn(mon, 2, 23, "[ RECONFIGURE ]", colors.purple, colors.white, "reconfig")
     
     -- Input overlay
     if inputMode == "add_guest" then
-        -- Box background
         for by = 10, 18 do
             for bx = 4, 22 do
                 mon.setBackgroundColor(colors.black)
@@ -466,7 +538,6 @@ function drawControlMonitor()
                 mon.write(" ")
             end
         end
-        -- Border
         mon.setBackgroundColor(colors.gray)
         for bx = 4, 22 do
             mon.setCursorPos(bx, 10)
@@ -513,7 +584,7 @@ function handleTouch(mx, my)
         if mx < 4 or mx > 22 or my < 10 or my > 18 then
             inputMode = nil
             inputBuffer = ""
-            prevControlState = nil  -- Force redraw
+            prevControlState = nil
             drawControlMonitor()
         end
         return
@@ -540,25 +611,35 @@ function execAction(action)
     elseif action == "toggle_door2" then
         state.manualOverride2 = not state.manualOverride2
         setDoor(2, not state.door2Open)
-    elseif action == "radius_down" then
-        if state.radius > 1 then state.radius = state.radius - 1 end
-    elseif action == "radius_up" then
-        if state.radius < 64 then state.radius = state.radius + 1 end
+    elseif action == "radius1_down" then
+        if state.radius1 > 1 then state.radius1 = state.radius1 - 1 end
+        savePersistentData()
+    elseif action == "radius1_up" then
+        if state.radius1 < 64 then state.radius1 = state.radius1 + 1 end
+        savePersistentData()
+    elseif action == "radius2_down" then
+        if state.radius2 > 1 then state.radius2 = state.radius2 - 1 end
+        savePersistentData()
+    elseif action == "radius2_up" then
+        if state.radius2 < 64 then state.radius2 = state.radius2 + 1 end
+        savePersistentData()
     elseif action == "add_guest" then
         inputMode = "add_guest"
         inputBuffer = ""
-        prevControlState = nil  -- Force redraw
+        prevControlState = nil
         drawControlMonitor()
         return
     elseif action:sub(1, 7) == "remove_" then
         local name = action:sub(8)
         state.allowedGuests[name] = nil
+        savePersistentData()
     elseif action == "reconfig" then
         fs.delete("door_config.txt")
+        fs.delete("guests.txt")
+        fs.delete("radii.txt")
         os.reboot()
     end
     
-    -- Force redraw after action
     prevControlState = nil
     prevStatusState = nil
     drawControlMonitor()
@@ -574,10 +655,11 @@ function handleKeyboardInput()
             if key == keys.enter then
                 if inputBuffer ~= "" then
                     state.allowedGuests[inputBuffer] = true
+                    savePersistentData()
                 end
                 inputMode = nil
                 inputBuffer = ""
-                prevControlState = nil  -- Force redraw
+                prevControlState = nil
                 drawControlMonitor()
                 drawStatusMonitor()
             elseif key == keys.backspace then
@@ -610,7 +692,7 @@ function handleKeyboardInput()
 end
 
 -- ============================================
--- KEY PROCESSING
+-- KEY PROCESSING - PER DOOR WITH INDIVIDUAL RADIUS
 -- ============================================
 
 function processPing(message, distance, modemSide)
@@ -625,10 +707,14 @@ function processPing(message, distance, modemSide)
     end
     
     local targetDoor = nil
+    local targetRadius = nil
+    
     if modemSide == config.modem1 then
         targetDoor = 1
+        targetRadius = state.radius1
     elseif modemSide == config.modem2 then
         targetDoor = 2
+        targetRadius = state.radius2
     else
         return
     end
@@ -647,7 +733,7 @@ function processPing(message, distance, modemSide)
         end
     end
     
-    if distance <= state.radius then
+    if distance <= targetRadius then
         local now = os.clock()
         
         state.activePings[player] = {
@@ -671,9 +757,10 @@ end
 -- ============================================
 
 function mainLoop()
-    print("=== Door System v8.0 ===")
+    print("=== Door System v9.0 ===")
     print("Owner: " .. OWNER_NAME)
-    print("Radius: " .. state.radius)
+    print("Radius1: " .. state.radius1 .. " | Radius2: " .. state.radius2)
+    print("Guests: " .. countGuests())
     print("")
     
     if config.statusMonitor then print("Status:  " .. peripheral.getName(config.statusMonitor)) end
@@ -684,7 +771,6 @@ function mainLoop()
     print("Modem Door 2: " .. (config.modem2 or "NONE"))
     print("")
     
-    -- Initial draw
     prevStatusState = nil
     prevControlState = nil
     drawStatusMonitor()
@@ -722,7 +808,6 @@ function mainLoop()
                         door2Changed = true
                     end
                     
-                    -- Only redraw if something changed
                     if door1Changed or door2Changed then
                         prevStatusState = nil
                         prevControlState = nil
@@ -740,7 +825,6 @@ function mainLoop()
                     if channel == KEY_CHANNEL then
                         if side == config.modem1 or side == config.modem2 then
                             processPing(message, distance, side)
-                            -- Force redraw after ping processed
                             prevStatusState = nil
                             prevControlState = nil
                             drawStatusMonitor()
@@ -765,9 +849,18 @@ function mainLoop()
     )
 end
 
+function countGuests()
+    local c = 0
+    for _ in pairs(state.allowedGuests) do c = c + 1 end
+    return c
+end
+
 -- ============================================
 -- STARTUP
 -- ============================================
+
+-- Load persistent data first
+loadPersistentData()
 
 local hasConfig = loadConfig()
 
@@ -775,6 +868,8 @@ if not hasConfig then
     runConfiguration()
 else
     print("Config loaded. Delete door_config.txt to reconfigure.")
+    print("Guests: " .. countGuests())
+    print("Radius1: " .. state.radius1 .. ", Radius2: " .. state.radius2)
     print("")
 end
 
