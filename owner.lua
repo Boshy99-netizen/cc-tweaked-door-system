@@ -124,25 +124,25 @@ function drawMainPage()
     
     -- Status line
     term.setTextColor(colors.lime)
-    term.setCursorPos(cx - 3, 10)
+    term.setCursorPos(cx - 3, 9)
     write("[OWNER]")
     
     -- Current time
     term.setTextColor(colors.lightGray)
     local timeStr = textutils.formatTime(os.time(), false)
-    term.setCursorPos(cx - math.floor(#timeStr / 2), 12)
+    term.setCursorPos(cx - math.floor(#timeStr / 2), 11)
     write(timeStr)
     
     -- Base status (will be updated from replies)
     term.setTextColor(colors.gray)
-    term.setCursorPos(3, 14)
+    term.setCursorPos(3, 13)
     write("Base: Waiting...")
     
-    -- Navigation buttons
+    -- Navigation buttons (vertical aligned list)
     buttons = {}
-    buttons.doors = drawButton(3, 16, " [ DOORS ] ", colors.blue, colors.white)
-    buttons.guests = drawButton(15, 16, " [ GUESTS ] ", colors.yellow, colors.black)
-    buttons.settings = drawButton(3, 18, " [ SETTINGS ] ", colors.purple, colors.white)
+    buttons.doors    = drawButton(4, 15, "[ DOORS    ]", colors.blue,   colors.white)
+    buttons.guests   = drawButton(4, 16, "[ GUESTS   ]", colors.yellow, colors.black)
+    buttons.settings = drawButton(4, 17, "[ SETTINGS ]", colors.purple, colors.white)
     
     -- Ping indicator
     term.setTextColor(colors.gray)
@@ -341,7 +341,7 @@ function mainLoop()
                 local timeStr = textutils.formatTime(os.time(), false)
                 local w = term.getSize()
                 local cx = math.floor(w / 2)
-                term.setCursorPos(cx - math.floor(#timeStr / 2), 12)
+                term.setCursorPos(cx - math.floor(#timeStr / 2), 11)
                 write(timeStr)
             end
             
@@ -356,7 +356,7 @@ function mainLoop()
                 if message.type == "BASE_STATUS" and currentPage == "main" then
                     -- Update base status on main page
                     term.setTextColor(message.locked and colors.red or colors.lime)
-                    term.setCursorPos(9, 14)
+                    term.setCursorPos(9, 13)
                     write(message.locked and "LOCKED  " or "OPEN    ")
                 elseif message.type == "GUEST_LIST" and currentPage == "guests" then
                     -- Update guest list
