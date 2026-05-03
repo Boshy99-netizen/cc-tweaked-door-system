@@ -719,15 +719,25 @@ function processPing(message, distance, modemSide)
         return
     end
     
+    -- Check lock (only owner can open when locked)
     if state.locked then
         if player ~= OWNER_NAME or keyType ~= "owner" then
             return
         end
     end
     
+    -- Check permissions
     if keyType == "owner" then
         if player ~= OWNER_NAME then return end
+    elseif keyType == "team" then
+        -- Team/Clan: must be in guest list (treated as trusted)
+        if player ~= OWNER_NAME and not state.allowedGuests[player] then
+            return
+        end
+        -- Team opens BOTH doors when near ANY modem
+        targetDoor = "both"
     else
+        -- Regular guest: must be in list
         if player ~= OWNER_NAME and not state.allowedGuests[player] then
             return
         end
@@ -744,9 +754,13 @@ function processPing(message, distance, modemSide)
         }
         state.lastPingTime[player] = now
         
+        -- Open door(s)
         if targetDoor == 1 then
             setDoor(1, true)
         elseif targetDoor == 2 then
+            setDoor(2, true)
+        elseif targetDoor == "both" then
+            setDoor(1, true)
             setDoor(2, true)
         end
     end
@@ -848,6 +862,75 @@ function mainLoop()
         end
     )
 end
+
+elseif event[1] == "modem_message" then
+    local side = event[2]
+    local channel = event[3]
+    local replyChannel = event[4]
+    local message = event[5]
+    local distance = event[6]
+    
+    if channel == KEY_CHANNEL then
+        -- Regular ping
+        if side == config.modem1 or side == config.modem2 then
+            processPing(message, distance, side)
+            prevStatusState = nil
+            prevControlState = nil
+            drawStatusMonitor()
+            drawControlMonitor()
+        end
+        
+        -- Owner commands
+        if type(message) == "table" and message.type == "OWNER_COMMAND" then
+            if message.player == OWNER_NAME and message.keyType == "owner" then
+                local cmd = message.command
+                local data = message.data
+                
+                if cmd == "open_door" then
+                    if data == 1 then setDoor(1, true); state.manualOverride1 = true
+                    elseif data == 2 then setDoor(2, true); state.manualOverride2 = true end
+                elseif cmd == "close_door" then
+                    if data == 1 then setDoor(1, false); state.manualOverride1 = false
+                    elseif data == 2 then setDoor(2, false); state.manualOverride2 = false end
+                elseif cmd == "open_all" then
+                    setDoor(1, true); setDoor(2, true)
+                    state.manualOverride1 = true; state.manualOverride2 = true
+                elseif cmd == "close_all" then
+                    setDoor(1, false); setDoor(2, false)
+                    state.manualOverride1 = false; state.manualOverride2 = false
+                elseif cmd == "toggle_lock" then
+                    state.locked = not state.locked
+                    if state.locked then
+                        setDoor(1, false); setDoor(2, false)
+                    end
+                elseif cmd == "add_guest" then
+                    state.allowedGuests[data] = true
+                    savePersistentData()
+                elseif cmd == "remove_guest" then
+                    state.allowedGuests[data] = nil
+                    savePersistentData()
+                elseif cmd == "REQUEST_GUESTS" then
+                    -- Send guest list back
+                    local guests = {}
+                    for name, _ in pairs(state.allowedGuests) do table.insert(guests, name) end
+                    table.sort(guests)
+                    
+                    -- Find modem to reply
+                    if config.mainModem then
+                        config.mainModem.transmit(REPLY_CHANNEL, KEY_CHANNEL, {
+                            type = "GUEST_LIST",
+                            guests = guests
+                        })
+                    end
+                end
+                
+                prevStatusState = nil
+                prevControlState = nil
+                drawStatusMonitor()
+                drawControlMonitor()
+            end
+        end
+    end
 
 function countGuests()
     local c = 0
