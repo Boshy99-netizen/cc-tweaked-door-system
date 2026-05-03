@@ -32,8 +32,9 @@ modem.open(REPLY_CHANNEL)
 -- PAGES
 -- ============================================
 
-local currentPage = "main"  -- main, doors, guests, settings
+local currentPage = "main"  -- main, guests
 local buttons = {}          -- shared between draw funcs and handleClick
+local baseLocked = nil      -- nil = unknown, true/false from BASE_STATUS
 
 -- ============================================
 -- DRAW FUNCTIONS
@@ -134,55 +135,34 @@ function drawMainPage()
     term.setCursorPos(cx - math.floor(#timeStr / 2), 11)
     write(timeStr)
     
-    -- Base status (will be updated from replies)
+    -- Base status line
     term.setTextColor(colors.gray)
     term.setCursorPos(3, 13)
-    write("Base: Waiting...")
+    write("Base: ")
+    if baseLocked == nil then
+        term.setTextColor(colors.gray)
+        write("Waiting...")
+    elseif baseLocked then
+        term.setTextColor(colors.red)
+        write("LOCKED  ")
+    else
+        term.setTextColor(colors.lime)
+        write("OPEN    ")
+    end
     
-    -- Navigation buttons (vertical aligned list)
+    -- Action buttons (vertical aligned list)
     buttons = {}
-    buttons.doors    = drawButton(4, 15, "[ DOORS    ]", colors.blue,   colors.white)
-    buttons.guests   = drawButton(4, 16, "[ GUESTS   ]", colors.yellow, colors.black)
-    buttons.settings = drawButton(4, 17, "[ SETTINGS ]", colors.purple, colors.white)
+    buttons.guests = drawButton(4, 15, "[  GUESTS   ]", colors.yellow, colors.black)
+    if baseLocked then
+        buttons.toggle_lock = drawButton(4, 16, "[  UNLOCK   ]", colors.red,  colors.white)
+    else
+        buttons.toggle_lock = drawButton(4, 16, "[ LOCK BASE ]", colors.purple, colors.white)
+    end
     
     -- Ping indicator
     term.setTextColor(colors.gray)
     term.setCursorPos(3, h - 1)
     write("Signal: OK")
-end
-
--- ============================================
--- DOORS PAGE — REMOTE CONTROL
--- ============================================
-
-function drawDoorsPage()
-    clearScreen()
-    drawFrame()
-    drawHeader("  REMOTE DOORS  ")
-    
-    local w = term.getSize()
-    buttons = {}
-    
-    -- Door 1
-    term.setTextColor(colors.white)
-    term.setCursorPos(4, 5)
-    write("DOOR 1:")
-    buttons.door1_open = drawButton(4, 7, " [ OPEN ] ", colors.green, colors.white)
-    buttons.door1_close = drawButton(16, 7, " [ CLOSE ] ", colors.red, colors.white)
-    
-    -- Door 2
-    term.setTextColor(colors.white)
-    term.setCursorPos(4, 10)
-    write("DOOR 2:")
-    buttons.door2_open = drawButton(4, 12, " [ OPEN ] ", colors.green, colors.white)
-    buttons.door2_close = drawButton(16, 12, " [ CLOSE ] ", colors.red, colors.white)
-    
-    -- Open both
-    buttons.both_open = drawButton(4, 15, " [ OPEN ALL ] ", colors.lime, colors.black)
-    buttons.both_close = drawButton(16, 15, " [ CLOSE ALL ] ", colors.orange, colors.white)
-    
-    -- Back button
-    buttons.back = drawButton(4, 18, " [ BACK ] ", colors.gray, colors.white)
 end
 
 -- ============================================
@@ -259,33 +239,6 @@ function drawGuestInput()
 end
 
 -- ============================================
--- SETTINGS PAGE
--- ============================================
-
-function drawSettingsPage()
-    clearScreen()
-    drawFrame()
-    drawHeader("  BASE SETTINGS  ")
-    
-    local w = term.getSize()
-    buttons = {}
-    
-    -- Lock/Unlock base
-    term.setTextColor(colors.white)
-    term.setCursorPos(4, 5)
-    write("BASE LOCK:")
-    buttons.toggle_lock = drawButton(4, 7, " [ TOGGLE LOCK ] ", colors.purple, colors.white)
-    
-    -- Radius info
-    term.setTextColor(colors.lightGray)
-    term.setCursorPos(4, 10)
-    write("Radii set on base PC")
-    
-    -- Back
-    buttons.back = drawButton(4, 18, " [ BACK ] ", colors.gray, colors.white)
-end
-
--- ============================================
 -- INPUT HANDLING
 -- ============================================
 
@@ -325,7 +278,7 @@ function mainLoop()
     local timerId = os.startTimer(INTERVAL)
     
     while true do
-        local event = {os.pullEvent()}
+        local event = {os.pullEventRaw()}
         
         if event[1] == "timer" and event[2] == timerId then
             -- Send regular ping
@@ -356,11 +309,13 @@ function mainLoop()
             local distance = event[6]
             
             if type(message) == "table" then
-                if message.type == "BASE_STATUS" and currentPage == "main" then
-                    -- Update base status on main page
-                    term.setTextColor(message.locked and colors.red or colors.lime)
-                    term.setCursorPos(9, 13)
-                    write(message.locked and "LOCKED  " or "OPEN    ")
+                if message.type == "BASE_STATUS" then
+                    -- Save state and refresh main page only on change
+                    local changed = (baseLocked ~= message.locked)
+                    baseLocked = message.locked
+                    if currentPage == "main" and changed then
+                        drawMainPage()
+                    end
                 elseif message.type == "GUEST_LIST" and currentPage == "guests" then
                     -- Update guest list
                     clearScreen()
@@ -395,33 +350,12 @@ function mainLoop()
             
             if clicked then
                 if currentPage == "main" then
-                    if clicked == "doors" then
-                        currentPage = "doors"
-                        drawDoorsPage()
-                    elseif clicked == "guests" then
+                    if clicked == "guests" then
                         currentPage = "guests"
                         drawGuestsPage()
-                    elseif clicked == "settings" then
-                        currentPage = "settings"
-                        drawSettingsPage()
-                    end
-                    
-                elseif currentPage == "doors" then
-                    if clicked == "door1_open" then
-                        sendCommand("open_door", 1)
-                    elseif clicked == "door1_close" then
-                        sendCommand("close_door", 1)
-                    elseif clicked == "door2_open" then
-                        sendCommand("open_door", 2)
-                    elseif clicked == "door2_close" then
-                        sendCommand("close_door", 2)
-                    elseif clicked == "both_open" then
-                        sendCommand("open_all")
-                    elseif clicked == "both_close" then
-                        sendCommand("close_all")
-                    elseif clicked == "back" then
-                        currentPage = "main"
-                        drawMainPage()
+                    elseif clicked == "toggle_lock" then
+                        sendCommand("toggle_lock")
+                        -- BASE_STATUS reply will trigger redraw
                     end
                     
                 elseif currentPage == "guests" then
@@ -437,14 +371,6 @@ function mainLoop()
                         sendCommand("remove_guest", name)
                         sleep(0.5)
                         drawGuestsPage()
-                    end
-                    
-                elseif currentPage == "settings" then
-                    if clicked == "toggle_lock" then
-                        sendCommand("toggle_lock")
-                    elseif clicked == "back" then
-                        currentPage = "main"
-                        drawMainPage()
                     end
                 end
             end
