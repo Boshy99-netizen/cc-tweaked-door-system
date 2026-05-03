@@ -217,10 +217,12 @@ function mainLoop()
     
     drawPass()
     
+    local timerId = os.startTimer(INTERVAL)
+    
     while true do
-        local event = {os.pullEvent()}
+        local event = {os.pullEventRaw()}
         
-        if event[1] == "timer" then
+        if event[1] == "timer" and event[2] == timerId then
             -- Send ping with type
             modem.transmit(KEY_CHANNEL, REPLY_CHANNEL, {
                 type = "KEY_PING",
@@ -245,16 +247,7 @@ function mainLoop()
             term.setCursorPos(11, 17)
             write(" ")
             
-        elseif event[1] == "key" then
-            local key = event[2]
-            -- Press 'R' to reset type
-            if key == keys.r then
-                settings.set("key_type", nil)
-                settings.save()
-                print("Type reset! Reboot...")
-                sleep(1)
-                os.reboot()
-            end
+            timerId = os.startTimer(INTERVAL)
         end
     end
 end
