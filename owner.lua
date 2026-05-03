@@ -33,6 +33,7 @@ modem.open(REPLY_CHANNEL)
 -- ============================================
 
 local currentPage = "main"  -- main, doors, guests, settings
+local buttons = {}          -- shared between draw funcs and handleClick
 
 -- ============================================
 -- DRAW FUNCTIONS
@@ -287,8 +288,6 @@ end
 -- ============================================
 -- INPUT HANDLING
 -- ============================================
-
-local buttons = {}
 
 function handleClick(x, y)
     for name, area in pairs(buttons) do
