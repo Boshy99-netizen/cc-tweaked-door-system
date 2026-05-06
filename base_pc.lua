@@ -47,6 +47,10 @@ local prevControlState = nil
 -- Periodic broadcast counter (every Nth timer tick)
 local broadcastTick = 0
 
+-- TPS measurement (timer-based, runs in main loop)
+local tpsLastReal = nil       -- os.epoch("utc") of last 0.5s timer fire
+local tpsCurrent  = 20.0      -- smoothed TPS
+
 -- ============================================
 -- SAVE/LOAD PERSISTENT DATA
 -- ============================================
@@ -702,6 +706,10 @@ function sendBaseStatus(modemSide)
         locked = state.locked,
         door1Open = state.door1Open,
         door2Open = state.door2Open,
+        tps = tpsCurrent,
+        gameTime = os.time(),       -- 0..24 in-game hours
+        gameDay = os.day(),
+        realEpoch = os.epoch("utc"),
     }
     local function send(name)
         if not name then return end
@@ -733,8 +741,8 @@ end
 
 function handleOwnerCommand(message)
     print("[CMD] from='" .. tostring(message.player) .. "' cmd='" .. tostring(message.command) .. "'")
-    if message.player ~= OWNER_NAME then
-        print("[CMD-REJECT] '" .. tostring(message.player) .. "' != OWNER_NAME '" .. OWNER_NAME .. "' (case-sensitive!)")
+    if string.lower(tostring(message.player)) ~= string.lower(OWNER_NAME) then
+        print("[CMD-REJECT] '" .. tostring(message.player) .. "' != OWNER_NAME '" .. OWNER_NAME .. "'")
         return
     end
     local cmd = message.command
@@ -803,14 +811,14 @@ function processPing(message, distance, modemSide)
     
     -- Permission checks per key type
     if keyType == "owner" then
-        -- Owner: always works (even when locked)
-        if player ~= OWNER_NAME then
+        -- Owner: always works (even when locked). Case-insensitive name check.
+        if string.lower(tostring(player)) ~= string.lower(OWNER_NAME) then
             print("[REJECT] " .. tostring(player) .. " - claims owner but name != " .. OWNER_NAME)
             return
         end
     elseif keyType == "team" then
         -- Team: always works (LOCK is ignored), but must be in guest list
-        if player ~= OWNER_NAME and not state.allowedGuests[player] then
+        if string.lower(tostring(player)) ~= string.lower(OWNER_NAME) and not state.allowedGuests[player] then
             print("[REJECT] " .. tostring(player) .. " (team) - NOT in guest list. Add via owner key.")
             return
         end
@@ -820,7 +828,7 @@ function processPing(message, distance, modemSide)
             print("[REJECT] " .. tostring(player) .. " (guest) - base is LOCKED, guests denied")
             return
         end
-        if player ~= OWNER_NAME and not state.allowedGuests[player] then
+        if string.lower(tostring(player)) ~= string.lower(OWNER_NAME) and not state.allowedGuests[player] then
             print("[REJECT] " .. tostring(player) .. " (guest) - NOT in guest list. Add via owner key.")
             return
         end
@@ -875,6 +883,20 @@ function mainLoop()
                 
                 if event[1] == "timer" then
                     local now = os.clock()
+
+                    -- TPS measurement: timer fires every 0.5 game-second = 10 ticks.
+                    -- At TPS=20 that's ~500ms real. Lower TPS = more real ms elapsed.
+                    local nowReal = os.epoch("utc")
+                    if tpsLastReal then
+                        local realDelta = nowReal - tpsLastReal
+                        if realDelta > 0 then
+                            local instant = math.min(20, 500 / realDelta * 20)
+                            -- Smooth (EMA)
+                            tpsCurrent = tpsCurrent * 0.7 + instant * 0.3
+                        end
+                    end
+                    tpsLastReal = nowReal
+
                     local door1Active = false
                     local door2Active = false
                     
@@ -952,6 +974,18 @@ function mainLoop()
                             drawControlMonitor()
                         elseif message.type == "REQUEST_GUESTS" then
                             sendGuestList(side)
+                        elseif message.type == "PING_REQUEST" then
+                            -- Echo immediately so the key can compute round-trip
+                            local m = peripheral.wrap(side)
+                            if m and m.transmit then
+                                m.transmit(REPLY_CHANNEL, KEY_CHANNEL, {
+                                    type = "PING_REPLY",
+                                    nonce = message.nonce,
+                                    tps = tpsCurrent,
+                                    gameTime = os.time(),
+                                    gameDay = os.day(),
+                                })
+                            end
                         end
                     end
                     
