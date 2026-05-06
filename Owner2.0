@@ -1,0 +1,683 @@
+-- ============================================
+-- OWNER KEY v11.0 — ELECTRONIC PASS
+-- 3-tab UI (HOME / GUESTS / SERVER) + modem auto-recovery
+-- ============================================
+
+local TICK_INTERVAL = 1     -- KEY_PING send interval
+local PING_INTERVAL = 2     -- ping round-trip every Ns
+local KEY_CHANNEL   = 100
+local REPLY_CHANNEL = 101
+
+-- ============================================
+-- INIT
+-- ============================================
+
+local playerName = settings.get("key_owner")
+if not playerName then
+    term.clear(); term.setCursorPos(1, 1)
+    print("Enter your Minecraft name:")
+    playerName = read()
+    settings.set("key_owner", playerName)
+    settings.save()
+end
+
+-- ============================================
+-- MODEM (with auto-recovery)
+-- Stale modem refs are the #1 reason keys "stop working" until reload.
+-- We re-resolve on every transmit failure and on peripheral events.
+-- ============================================
+
+local modem = nil
+local modemName = nil
+
+local function resolveModem()
+    modem = peripheral.find("modem")
+    if modem then
+        modemName = peripheral.getName(modem)
+        pcall(modem.open, REPLY_CHANNEL)
+    else
+        modemName = nil
+    end
+end
+
+local function safeTransmit(ch, replyCh, payload)
+    if not modem then resolveModem() end
+    if not modem then return false end
+    local ok = pcall(modem.transmit, ch, replyCh, payload)
+    if not ok then
+        modem = nil
+        modemName = nil
+        resolveModem()
+        if modem then
+            pcall(modem.transmit, ch, replyCh, payload)
+        end
+    end
+    return ok
+end
+
+resolveModem()
+if not modem then
+    term.clear(); term.setCursorPos(1, 1)
+    print("ERROR: No wireless modem!")
+    return
+end
+
+-- ============================================
+-- STATE
+-- ============================================
+
+local currentPage = "home"
+local buttons = {}
+
+-- Base info (received via BASE_STATUS / PING_REPLY)
+local baseLocked   = nil
+local baseTps      = nil
+local baseGameTime = nil
+local baseGameDay  = nil
+local lastBaseAt   = nil
+
+-- Ping measurement
+local pingNonce   = 0
+local pingPending = {}
+local lastPingMs  = nil
+
+-- Guest list (received from base)
+local guestList     = {}
+local guestInput    = ""
+local guestInputMode = false
+
+-- ============================================
+-- DRAW HELPERS
+-- ============================================
+
+local function clearScreen()
+    term.setBackgroundColor(colors.black)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
+
+local function drawFrame()
+    local w, h = term.getSize()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.gray)
+    term.setCursorPos(1, 1); term.write("+")
+    term.setCursorPos(w, 1); term.write("+")
+    term.setCursorPos(1, h); term.write("+")
+    term.setCursorPos(w, h); term.write("+")
+    for x = 2, w - 1 do
+        term.setCursorPos(x, 1); term.write("=")
+        term.setCursorPos(x, h); term.write("=")
+    end
+    for y = 2, h - 1 do
+        term.setCursorPos(1, y); term.write("|")
+        term.setCursorPos(w, y); term.write("|")
+    end
+end
+
+local function drawHeader(title)
+    local w = term.getSize()
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    for x = 2, w - 1 do
+        term.setCursorPos(x, 2); term.write(" ")
+    end
+    term.setCursorPos(math.floor((w - #title) / 2) + 1, 2)
+    term.write(title)
+    term.setBackgroundColor(colors.black)
+end
+
+local function centerWrite(y, text, color)
+    local w = term.getSize()
+    if color then term.setTextColor(color) end
+    term.setCursorPos(math.floor((w - #text) / 2) + 1, y)
+    term.write(text)
+end
+
+local function drawBtn(x, y, text, bg, fg, action)
+    term.setBackgroundColor(bg)
+    term.setTextColor(fg)
+    term.setCursorPos(x, y)
+    term.write(text)
+    term.setBackgroundColor(colors.black)
+    if action then
+        buttons[action] = { x1 = x, y1 = y, x2 = x + #text - 1, y2 = y }
+    end
+end
+
+-- ============================================
+-- NAV BAR (bottom 2 rows: separator + tabs)
+-- ============================================
+
+local function drawNavBar()
+    local w, h = term.getSize()
+
+    -- separator on h-2
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.gray)
+    term.setCursorPos(1, h - 2); term.write("+")
+    for x = 2, w - 1 do
+        term.setCursorPos(x, h - 2); term.write("-")
+    end
+    term.setCursorPos(w, h - 2); term.write("+")
+
+    local tabs = {
+        { key = "home",   label = " HOME ", act = "nav_home" },
+        { key = "guests", label = "GUESTS", act = "nav_guests" },
+        { key = "server", label = "SERVER", act = "nav_server" },
+    }
+
+    local totalW = w - 2
+    local tabW = math.floor(totalW / 3)
+    local extra = totalW - 3 * tabW
+
+    local x = 2
+    for i, t in ipairs(tabs) do
+        local tw = tabW + (i == 1 and extra or 0)
+        local active = (currentPage == t.key)
+        local bg = active and colors.yellow or colors.gray
+        local fg = active and colors.black or colors.white
+
+        local pad = tw - #t.label
+        local leftPad = math.floor(pad / 2)
+        local rightPad = pad - leftPad
+        local s = string.rep(" ", leftPad) .. t.label .. string.rep(" ", rightPad)
+
+        term.setBackgroundColor(bg)
+        term.setTextColor(fg)
+        term.setCursorPos(x, h - 1)
+        term.write(s)
+
+        buttons[t.act] = { x1 = x, y1 = h - 1, x2 = x + tw - 1, y2 = h - 1 }
+        x = x + tw
+    end
+    term.setBackgroundColor(colors.black)
+end
+
+-- ============================================
+-- HOME — Electronic Pass + lock control
+-- ============================================
+
+local function drawHomePage()
+    clearScreen()
+    drawFrame()
+    drawHeader(" ELECTRONIC PASS ")
+    buttons = {}
+
+    local w, h = term.getSize()
+
+    -- Diamond icon (yellow)
+    term.setTextColor(colors.yellow)
+    centerWrite(4, "  /\\  ", colors.yellow)
+    centerWrite(5, " /  \\ ")
+    centerWrite(6, "<    >")
+    centerWrite(7, " \\  / ")
+    centerWrite(8, "  \\/  ")
+
+    -- Player name + status
+    centerWrite(10, playerName, colors.white)
+    centerWrite(11, "[OWNER]", colors.lime)
+
+    -- Base status row
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 13); term.write("Base: ")
+    if baseLocked == nil then
+        term.setTextColor(colors.gray);  term.write("Connecting...")
+    elseif baseLocked then
+        term.setTextColor(colors.red);   term.write("LOCKED       ")
+    else
+        term.setTextColor(colors.lime);  term.write("OPEN         ")
+    end
+
+    -- Lock/unlock button
+    local btnText = baseLocked and "[ UNLOCK BASE ]" or "[  LOCK BASE  ]"
+    local btnBg   = baseLocked and colors.red or colors.purple
+    local btnX = math.floor((w - #btnText) / 2) + 1
+    drawBtn(btnX, 15, btnText, btnBg, colors.white, "toggle_lock")
+
+    drawNavBar()
+end
+
+-- ============================================
+-- GUESTS — list + add/remove
+-- ============================================
+
+local function drawGuestsPage()
+    clearScreen()
+    drawFrame()
+    drawHeader(" GUEST LIST ")
+    buttons = {}
+
+    local w, h = term.getSize()
+
+    -- Total
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 4); term.write("Total: ")
+    term.setTextColor(colors.white); term.write(tostring(#guestList))
+
+    -- List rows 6..14 (max 9)
+    local maxRows = 9
+    if #guestList == 0 then
+        term.setTextColor(colors.gray)
+        centerWrite(8, "(no guests yet)", colors.gray)
+    else
+        for i = 1, math.min(#guestList, maxRows) do
+            local y = 5 + i
+            local name = guestList[i]
+            local maxNameLen = w - 9
+            local display = name
+            if #display > maxNameLen then
+                display = display:sub(1, maxNameLen - 1) .. "."
+            end
+            term.setTextColor(colors.yellow)
+            term.setCursorPos(3, y); term.write(display)
+            drawBtn(w - 5, y, "[X]", colors.red, colors.white, "remove_" .. name)
+        end
+    end
+
+    -- Add button
+    local btnText = "[ + ADD GUEST ]"
+    local btnX = math.floor((w - #btnText) / 2) + 1
+    drawBtn(btnX, 16, btnText, colors.green, colors.white, "add_guest")
+
+    drawNavBar()
+end
+
+local function drawGuestInput()
+    local w, h = term.getSize()
+    -- Modal box rows 8..14
+    term.setBackgroundColor(colors.black)
+    for y = 8, 14 do
+        for x = 3, w - 2 do
+            term.setCursorPos(x, y); term.write(" ")
+        end
+    end
+    term.setTextColor(colors.gray)
+    for x = 3, w - 2 do
+        term.setCursorPos(x, 8);  term.write("-")
+        term.setCursorPos(x, 14); term.write("-")
+    end
+    for y = 8, 14 do
+        term.setCursorPos(3, y);    term.write("|")
+        term.setCursorPos(w - 2, y); term.write("|")
+    end
+    term.setCursorPos(3, 8);     term.write("+")
+    term.setCursorPos(w - 2, 8); term.write("+")
+    term.setCursorPos(3, 14);    term.write("+")
+    term.setCursorPos(w - 2, 14);term.write("+")
+
+    centerWrite(10, "Enter guest name:", colors.white)
+
+    local inp = "> " .. guestInput .. "_"
+    if #inp > w - 6 then
+        inp = "> ..." .. guestInput:sub(-(w - 12)) .. "_"
+    end
+    term.setTextColor(colors.yellow)
+    term.setCursorPos(5, 12); term.write(inp)
+
+    centerWrite(13, "Enter=save  Esc=cancel", colors.gray)
+end
+
+-- ============================================
+-- SERVER — TPS, ping, time, day/night
+-- ============================================
+
+local function tpsColor(tps)
+    if tps == nil then return colors.gray end
+    if tps >= 19   then return colors.lime end
+    if tps >= 15   then return colors.yellow end
+    if tps >= 10   then return colors.orange end
+    return colors.red
+end
+
+local function pingColor(ms)
+    if ms == nil then return colors.gray end
+    if ms <= 60    then return colors.lime end
+    if ms <= 200   then return colors.yellow end
+    if ms <= 500   then return colors.orange end
+    return colors.red
+end
+
+local function drawProgressBar(x, y, width, value, vmax, color)
+    local filled = math.floor((width * value) / vmax + 0.5)
+    if filled < 0 then filled = 0 end
+    if filled > width then filled = width end
+
+    term.setCursorPos(x, y)
+    term.setBackgroundColor(color)
+    term.write(string.rep(" ", filled))
+    term.setBackgroundColor(colors.gray)
+    term.write(string.rep(" ", width - filled))
+    term.setBackgroundColor(colors.black)
+end
+
+local function formatGameTime(t)
+    if t == nil then return "--:--" end
+    local h = math.floor(t)
+    local m = math.floor((t - h) * 60)
+    return string.format("%02d:%02d", h, m)
+end
+
+local function isDay(t)
+    if t == nil then return nil end
+    return t >= 6.0 and t < 18.0
+end
+
+local function drawServerPage()
+    clearScreen()
+    drawFrame()
+    drawHeader(" SERVER STATUS ")
+    buttons = {}
+
+    local w, h = term.getSize()
+
+    -- ========= TPS =========
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 4); term.write("TPS")
+    local tpsStr = baseTps and string.format("%.1f", baseTps) or " -- "
+    term.setTextColor(tpsColor(baseTps))
+    term.setCursorPos(w - 1 - #tpsStr, 4); term.write(tpsStr)
+    drawProgressBar(3, 5, w - 4, baseTps or 0, 20, tpsColor(baseTps))
+
+    -- ========= PING =========
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 7); term.write("PING")
+    local pingStr = lastPingMs and (tostring(lastPingMs) .. " ms") or " -- "
+    term.setTextColor(pingColor(lastPingMs))
+    term.setCursorPos(w - 1 - #pingStr, 7); term.write(pingStr)
+    local pingPct = lastPingMs and math.min(500, lastPingMs) or 0
+    drawProgressBar(3, 8, w - 4, pingPct, 500, pingColor(lastPingMs))
+
+    -- separator
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.gray)
+    for x = 3, w - 2 do
+        term.setCursorPos(x, 10); term.write(".")
+    end
+
+    -- ========= TIME =========
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 11); term.write("Day")
+    if baseGameDay then
+        term.setTextColor(colors.white)
+        local s = tostring(baseGameDay)
+        term.setCursorPos(w - 1 - #s, 11); term.write(s)
+    else
+        term.setTextColor(colors.gray)
+        term.setCursorPos(w - 3, 11); term.write("--")
+    end
+
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 12); term.write("Time")
+    term.setTextColor(colors.white)
+    local timeStr = formatGameTime(baseGameTime)
+    term.setCursorPos(w - 1 - #timeStr, 12); term.write(timeStr)
+
+    local day = isDay(baseGameTime)
+    if day == true then
+        term.setTextColor(colors.yellow)
+        term.setCursorPos(3, 13); term.write("(*)  DAYTIME    ")
+    elseif day == false then
+        term.setTextColor(colors.lightBlue)
+        term.setCursorPos(3, 13); term.write("(C)  NIGHTTIME  ")
+    else
+        term.setTextColor(colors.gray)
+        term.setCursorPos(3, 13); term.write("...  unknown    ")
+    end
+
+    -- Real local time
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 15); term.write("Real")
+    term.setTextColor(colors.lightGray)
+    local realTime = textutils.formatTime(os.time("local"), true)
+    term.setCursorPos(w - 1 - #realTime, 15); term.write(realTime)
+
+    drawNavBar()
+end
+
+-- ============================================
+-- DISPATCH
+-- ============================================
+
+local function drawCurrentPage()
+    if currentPage == "home" then
+        drawHomePage()
+    elseif currentPage == "guests" then
+        drawGuestsPage()
+    elseif currentPage == "server" then
+        drawServerPage()
+    end
+    if guestInputMode then
+        drawGuestInput()
+    end
+end
+
+-- ============================================
+-- NETWORK
+-- ============================================
+
+local function sendCommand(cmd, data)
+    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
+        type    = "OWNER_COMMAND",
+        player  = playerName,
+        command = cmd,
+        data    = data,
+    })
+end
+
+local function sendKeyPing()
+    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
+        type      = "KEY_PING",
+        keyType   = "owner",
+        player    = playerName,
+        timestamp = os.time(),
+    })
+end
+
+local function sendPingRequest()
+    pingNonce = pingNonce + 1
+    local n = pingNonce
+    pingPending[n] = os.epoch("utc")
+    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
+        type   = "PING_REQUEST",
+        nonce  = n,
+        player = playerName,
+    })
+    -- Cleanup pending older than 5s
+    local now = os.epoch("utc")
+    for k, v in pairs(pingPending) do
+        if now - v > 5000 then pingPending[k] = nil end
+    end
+end
+
+local function requestGuests()
+    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
+        type    = "REQUEST_GUESTS",
+        player  = playerName,
+        keyType = "owner",
+    })
+end
+
+-- ============================================
+-- INPUT
+-- ============================================
+
+local function findClickedAction(x, y)
+    for name, area in pairs(buttons) do
+        if x >= area.x1 and x <= area.x2 and y >= area.y1 and y <= area.y2 then
+            return name
+        end
+    end
+    return nil
+end
+
+local function navigateTo(page)
+    if currentPage == page then return end
+    currentPage = page
+    if page == "guests" then requestGuests() end
+    if page == "server" then sendPingRequest() end
+    drawCurrentPage()
+end
+
+local function handleAction(action)
+    if action == "nav_home"   then navigateTo("home");   return end
+    if action == "nav_guests" then navigateTo("guests"); return end
+    if action == "nav_server" then navigateTo("server"); return end
+
+    if action == "toggle_lock" then
+        sendCommand("toggle_lock")
+        if baseLocked == nil then baseLocked = false end
+        baseLocked = not baseLocked
+        drawCurrentPage()
+        return
+    end
+
+    if action == "add_guest" then
+        guestInputMode = true
+        guestInput = ""
+        drawGuestInput()
+        return
+    end
+
+    if action:sub(1, 7) == "remove_" then
+        local name = action:sub(8)
+        sendCommand("remove_guest", name)
+        sleep(0.3)
+        requestGuests()
+        return
+    end
+end
+
+-- ============================================
+-- MAIN LOOP
+-- ============================================
+
+local function mainLoop()
+    clearScreen()
+    print("=== OWNER KEY v11.0 ===")
+    print("Player: " .. playerName)
+    print("Loading...")
+    sleep(0.4)
+
+    drawCurrentPage()
+    requestGuests()
+    sendPingRequest()
+
+    local pingTimer  = os.startTimer(TICK_INTERVAL)
+    local rttTimer   = os.startTimer(PING_INTERVAL)
+    local refreshTimer = os.startTimer(1)
+
+    while true do
+        local event = { os.pullEventRaw() }
+        local ev = event[1]
+
+        if ev == "timer" then
+            local id = event[2]
+            if id == pingTimer then
+                sendKeyPing()
+                pingTimer = os.startTimer(TICK_INTERVAL)
+            elseif id == rttTimer then
+                sendPingRequest()
+                rttTimer = os.startTimer(PING_INTERVAL)
+            elseif id == refreshTimer then
+                -- refresh visible dynamic UI
+                if currentPage == "server" or currentPage == "home" then
+                    drawCurrentPage()
+                end
+                refreshTimer = os.startTimer(1)
+            end
+
+        elseif ev == "modem_message" then
+            local message = event[5]
+            if type(message) == "table" then
+                if message.type == "BASE_STATUS" then
+                    baseLocked   = message.locked
+                    baseTps      = message.tps      or baseTps
+                    baseGameTime = message.gameTime or baseGameTime
+                    baseGameDay  = message.gameDay  or baseGameDay
+                    lastBaseAt   = os.epoch("utc")
+                    drawCurrentPage()
+                elseif message.type == "GUEST_LIST" then
+                    guestList = message.guests or {}
+                    if currentPage == "guests" then drawCurrentPage() end
+                elseif message.type == "PING_REPLY" then
+                    local n = message.nonce
+                    local sentAt = pingPending[n]
+                    if sentAt then
+                        lastPingMs = os.epoch("utc") - sentAt
+                        pingPending[n] = nil
+                    end
+                    if message.tps      then baseTps      = message.tps      end
+                    if message.gameTime then baseGameTime = message.gameTime end
+                    if message.gameDay  then baseGameDay  = message.gameDay  end
+                    if currentPage == "server" then drawCurrentPage() end
+                end
+            end
+
+        elseif ev == "mouse_click" or ev == "monitor_touch" then
+            local x, y = event[3], event[4]
+            if guestInputMode then
+                local w, h = term.getSize()
+                if x < 3 or x > w - 2 or y < 8 or y > 14 then
+                    guestInputMode = false
+                    guestInput = ""
+                    drawCurrentPage()
+                end
+            else
+                local clicked = findClickedAction(x, y)
+                if clicked then handleAction(clicked) end
+            end
+
+        elseif ev == "key" and guestInputMode then
+            local key = event[2]
+            if key == keys.enter then
+                if guestInput ~= "" then
+                    sendCommand("add_guest", guestInput)
+                    sleep(0.3)
+                    requestGuests()
+                end
+                guestInputMode = false
+                guestInput = ""
+                drawCurrentPage()
+            elseif key == keys.backspace then
+                if #guestInput > 0 then
+                    guestInput = guestInput:sub(1, -2)
+                    drawGuestInput()
+                end
+            elseif key == keys.escape then
+                guestInputMode = false
+                guestInput = ""
+                drawCurrentPage()
+            elseif key >= keys.a and key <= keys.z and #guestInput < 16 then
+                guestInput = guestInput .. string.char(key - keys.a + string.byte("a"))
+                drawGuestInput()
+            elseif key >= keys.zero and key <= keys.nine and #guestInput < 16 then
+                guestInput = guestInput .. string.char(key - keys.zero + string.byte("0"))
+                drawGuestInput()
+            elseif key == keys.space and #guestInput < 16 then
+                guestInput = guestInput .. " "
+                drawGuestInput()
+            elseif (key == keys.minus or key == keys.underscore) and #guestInput < 16 then
+                guestInput = guestInput .. "_"
+                drawGuestInput()
+            end
+
+        elseif ev == "peripheral" then
+            -- new peripheral attached: if it's a modem, re-resolve
+            if event[2] then
+                local ok, pType = pcall(peripheral.getType, event[2])
+                if ok and pType == "modem" then
+                    resolveModem()
+                end
+            end
+
+        elseif ev == "peripheral_detach" then
+            if event[2] == modemName then
+                modem = nil
+                modemName = nil
+                resolveModem()  -- maybe another modem is still attached
+            end
+        end
+    end
+end
+
+mainLoop()
