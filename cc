@@ -1,475 +1,346 @@
 -- ========================================
--- Create AE2 Controller v3.1 (FIX)
--- Create 6.0+ | CC:Tweaked 1.117.1
+-- ae2.lua — Create AE2 Controller v3.2
 -- ========================================
 
--- === НАСТРОЙКА ПЕРИФЕРИИ ===
-local VAULT = peripheral.wrap("create:item_vault_0")           -- Хранилище
-local CRAFTER = peripheral.wrap("create:mechanical_crafter_0") -- 5x5 крафтер
-local OUTPUT = peripheral.wrap("right")                        -- Бочка выхода (или nil)
-
+local VAULT = peripheral.wrap("create:item_vault_0")
+local CRAFTER = peripheral.wrap("create:mechanical_crafter_0")
+local OUTPUT = peripheral.wrap("right")
 local MONITOR = peripheral.find("monitor")
 
--- === КОНФИГ ===
-local CONFIG_FILE = "ae2_config.txt"
+local CONFIG_FILE = "ae2_slots.txt"
 local RECIPES_FILE = "ae2_recipes.txt"
 
--- Структура: {input = {1,2,3...}, output = {26,27...}}
-local SLOTS = {
-    input = {},
-    output = {}
-}
-
--- Рецепты
+-- Гарантированная инициализация
+local SLOTS = {input = {}, output = {}}
 local RECIPES = {}
 
--- ========================================
--- УТИЛИТЫ ФАЙЛОВ
--- ========================================
-
-function loadTable(filename)
+-- === ФАЙЛЫ ===
+function loadData(filename)
     if fs.exists(filename) then
         local f = fs.open(filename, "r")
         local data = textutils.unserialize(f.readAll())
         f.close()
-        return data
+        if type(data) == "table" then return data end
     end
     return nil
 end
 
-function saveTable(filename, data)
+function saveData(filename, data)
     local f = fs.open(filename, "w")
     f.write(textutils.serialize(data))
     f.close()
 end
 
--- ========================================
--- КАЛИБРОВКА СЛОТОВ
--- ========================================
-
-function calibrate()
-    print("=== КАЛИБРОВКА СЛОТОВ ===")
-    print("Убедись, что крафтер ПУСТ и подключён к вращению!")
-    print("Нажми Enter для начала...")
-    read()
-    
-    if not CRAFTER then
-        print("❌ Крафтер не подключен!")
-        return false
-    end
-    
-    -- Размер
-    local totalSlots = CRAFTER.size()
-    print("Всего слотов: " .. totalSlots)
-    
-    -- Очищаем всё
-    for slot = 1, totalSlots do
-        local item = CRAFTER.getItemDetail(slot)
-        if item then
-            VAULT.pullItems(peripheral.getName(CRAFTER), slot)
-        end
-    end
-    
-    -- Сбрасываем структуру
-    SLOTS = {input = {}, output = {}}
-    
-    print("Тестирование входных слотов...")
-    
-    -- Берём тестовый предмет
-    local testItem = "minecraft:stick"
-    local moved = VAULT.pushItems(peripheral.getName(CRAFTER), testItem, 1)
-    
-    if moved == 0 then
-        print("❌ Нет палок в Vault! Положи хотя бы 1.")
-        return false
-    end
-    
-    -- Ищем куда попало
-    for slot = 1, totalSlots do
-        local item = CRAFTER.getItemDetail(slot)
-        if item and item.name == testItem then
-            table.insert(SLOTS.input, slot)
-            print("  Входной слот: " .. slot)
-            -- Забираем обратно
-            VAULT.pullItems(peripheral.getName(CRAFTER), slot)
-        end
-    end
-    
-    -- Остальные — выходные
-    for slot = 1, totalSlots do
-        local isInput = false
-        for _, inp in ipairs(SLOTS.input) do
-            if inp == slot then isInput = true; break end
-        end
-        if not isInput then
-            table.insert(SLOTS.output, slot)
-        end
-    end
-    
-    print("Входных: " .. #SLOTS.input)
-    print("Выходных: " .. #SLOTS.output)
-    
-    saveTable(CONFIG_FILE, SLOTS)
-    print("✅ Калибровка сохранена!")
-    return true
-end
-
-function loadConfig()
-    local data = loadTable(CONFIG_FILE)
-    
-    -- Проверяем, что данные корректные
-    if data and type(data) == "table" and data.input and data.output 
-       and type(data.input) == "table" and type(data.output) == "table"
-       and #data.input > 0 then
+-- === ИНИЦИАЛИЗАЦИЯ ===
+function initSlots()
+    local data = loadData(CONFIG_FILE)
+    if data and data.input and data.output 
+       and type(data.input) == "table" and type(data.output) == "table" then
         SLOTS = data
         return true
     end
-    
-    -- Инициализируем пустую структуру
     SLOTS = {input = {}, output = {}}
     return false
 end
 
--- ========================================
--- ОБУЧЕНИЕ РЕЦЕПТАМ
--- ========================================
-
-function learnRecipe()
-    print("=== ОБУЧЕНИЕ РЕЦЕПТА ===")
-    
-    if #SLOTS.input == 0 then
-        print("❌ Сначала выполни calibrate()!")
-        return
+function initRecipes()
+    local data = loadData(RECIPES_FILE)
+    if data and type(data) == "table" then
+        RECIPES = data
+        return true
     end
-    
-    print("1. Положи предметы ВРУЧНУЮ в крафтер")
-    print("2. Дождись завершения крафта")
-    print("3. Нажми Enter")
+    RECIPES = {}
+    return false
+end
+
+-- === КАЛИБРОВКА ===
+function calibrate()
+    print("=== КАЛИБРОВКА ===")
+    print("Убедись: крафтер ПУСТ, есть палки в Vault, подключено вращение")
+    print("Нажми Enter...")
     read()
     
-    -- Сканируем входные слоты
-    local recipeSlots = {}
-    local hasItems = false
+    if not CRAFTER then print("❌ Нет крафтера!"); return false end
     
-    for _, slot in ipairs(SLOTS.input) do
-        local item = CRAFTER.getItemDetail(slot)
-        if item then
-            recipeSlots[tostring(slot)] = item.name  -- ключ как строка для сериализации
-            hasItems = true
-            print("  Слот " .. slot .. ": " .. item.name)
+    local total = CRAFTER.size()
+    print("Слотов: " .. total)
+    
+    -- Чистим
+    for i = 1, total do
+        if CRAFTER.getItemDetail(i) then
+            VAULT.pullItems(peripheral.getName(CRAFTER), i)
         end
     end
     
-    if not hasItems then
-        print("❌ Входные слоты пусты!")
-        return
+    SLOTS = {input = {}, output = {}}
+    
+    -- Тест
+    if VAULT.pushItems(peripheral.getName(CRAFTER), "minecraft:stick", 1) == 0 then
+        print("❌ Нет палок в Vault!")
+        return false
     end
     
-    -- Ищем результат
-    local resultItem = nil
-    local resultSlots = {}
-    
-    -- В выходных слотах крафтера
-    for _, slot in ipairs(SLOTS.output) do
-        local item = CRAFTER.getItemDetail(slot)
-        if item then
-            resultItem = item.name
-            table.insert(resultSlots, slot)
+    -- Ищем палку
+    for i = 1, total do
+        local item = CRAFTER.getItemDetail(i)
+        if item and item.name == "minecraft:stick" then
+            table.insert(SLOTS.input, i)
+            print("  Вход: " .. i)
+            VAULT.pullItems(peripheral.getName(CRAFTER), i)
         end
     end
     
-    -- В бочке выхода
-    if OUTPUT and not resultItem then
-        for slot = 1, OUTPUT.size() do
-            local item = OUTPUT.getItemDetail(slot)
-            if item then
-                resultItem = item.name
-                table.insert(resultSlots, "out:" .. slot)
-            end
-        end
+    -- Остальные — выход
+    for i = 1, total do
+        local found = false
+        for _, v in ipairs(SLOTS.input) do if v == i then found = true end end
+        if not found then table.insert(SLOTS.output, i) end
     end
     
-    if not resultItem then
-        print("⚠️ Результат не найден!")
-        print("Введи название результата вручную (или Enter для отмены):")
-        resultItem = read()
-        if resultItem == "" then return end
-    end
-    
-    print("Результат: " .. resultItem)
-    print("Введи название рецепта:")
-    local recipeName = read()
-    if recipeName == "" then print("❌ Отмена"); return end
-    
-    RECIPES[recipeName] = {
-        slots = recipeSlots,
-        result = resultItem,
-        result_slots = resultSlots
-    }
-    
-    saveTable(RECIPES_FILE, RECIPES)
-    print("✅ Сохранён: " .. recipeName)
-    
-    storeOutput()
+    print("Вход: " .. #SLOTS.input .. ", Выход: " .. #SLOTS.output)
+    saveData(CONFIG_FILE, SLOTS)
+    print("✅ Сохранено!")
+    return true
 end
 
--- ========================================
--- ВЫПОЛНЕНИЕ РЕЦЕПТА
--- ========================================
+-- === ОБУЧЕНИЕ ===
+function learn()
+    if #SLOTS.input == 0 then print("❌ Сначала calibrate()!"); return end
+    
+    print("Положи предметы в крафтер, дождись крафта, нажми Enter")
+    read()
+    
+    local slots = {}
+    local has = false
+    
+    for _, s in ipairs(SLOTS.input) do
+        local item = CRAFTER.getItemDetail(s)
+        if item then
+            slots[tostring(s)] = item.name
+            has = true
+            print("  Слот " .. s .. ": " .. item.name)
+        end
+    end
+    
+    if not has then print("❌ Пусто!"); return end
+    
+    -- Результат
+    local result = nil
+    for _, s in ipairs(SLOTS.output) do
+        local item = CRAFTER.getItemDetail(s)
+        if item then result = item.name; break end
+    end
+    
+    if not result and OUTPUT then
+        for s = 1, OUTPUT.size() do
+            local item = OUTPUT.getItemDetail(s)
+            if item then result = item.name; break end
+        end
+    end
+    
+    if not result then
+        print("Введи результат вручную:")
+        result = read()
+        if result == "" then return end
+    end
+    
+    print("Результат: " .. result)
+    print("Название рецепта:")
+    local name = read()
+    if name == "" then return end
+    
+    RECIPES[name] = {slots = slots, result = result}
+    saveData(RECIPES_FILE, RECIPES)
+    print("✅ " .. name)
+    store()
+end
 
+-- === КРАФТ ===
 function vaultItems()
-    local items = {}
-    if not VAULT then return items end
-    for slot = 1, VAULT.size() do
-        local item = VAULT.getItemDetail(slot)
-        if item then
-            items[item.name] = (items[item.name] or 0) + item.count
-        end
+    local t = {}
+    if not VAULT then return t end
+    for i = 1, VAULT.size() do
+        local item = VAULT.getItemDetail(i)
+        if item then t[item.name] = (t[item.name] or 0) + item.count end
     end
-    return items
+    return t
 end
 
-function vaultHas(required)
+function needs(recipe)
+    local t = {}
+    for _, item in pairs(recipe.slots) do
+        t[item] = (t[item] or 0) + 1
+    end
+    return t
+end
+
+function check(req)
     local have = vaultItems()
-    for item, count in pairs(required) do
+    for item, count in pairs(req) do
         if (have[item] or 0) < count then
-            return false, item .. ": нужно " .. count .. ", есть " .. (have[item] or 0)
+            return false, item .. ": " .. (have[item] or 0) .. "/" .. count
         end
     end
     return true
 end
 
-function recipeNeeds(recipe)
-    local needs = {}
-    for slot, item in pairs(recipe.slots) do
-        needs[item] = (needs[item] or 0) + 1
-    end
-    return needs
-end
-
-function clearCrafter()
-    for _, slot in ipairs(SLOTS.input) do
-        local item = CRAFTER.getItemDetail(slot)
-        if item then
-            VAULT.pullItems(peripheral.getName(CRAFTER), slot)
+function clear()
+    for _, s in ipairs(SLOTS.input) do
+        if CRAFTER.getItemDetail(s) then
+            VAULT.pullItems(peripheral.getName(CRAFTER), s)
         end
     end
-    for _, slot in ipairs(SLOTS.output) do
-        local item = CRAFTER.getItemDetail(slot)
-        if item then
-            VAULT.pullItems(peripheral.getName(CRAFTER), slot)
+    for _, s in ipairs(SLOTS.output) do
+        if CRAFTER.getItemDetail(s) then
+            VAULT.pullItems(peripheral.getName(CRAFTER), s)
         end
     end
 end
 
-function loadRecipe(recipe)
-    for slotStr, itemName in pairs(recipe.slots) do
+function loadR(recipe)
+    for slotStr, item in pairs(recipe.slots) do
         local slot = tonumber(slotStr)
-        local moved = VAULT.pushItems(peripheral.getName(CRAFTER), itemName, 1, slot)
-        if moved == 0 then
-            print("❌ Не удалось: " .. itemName .. " в слот " .. slot)
+        if VAULT.pushItems(peripheral.getName(CRAFTER), item, 1, slot) == 0 then
+            print("❌ Нет " .. item)
             return false
         end
     end
     return true
 end
 
-function storeOutput()
-    local total = 0
-    
-    for _, slot in ipairs(SLOTS.output) do
-        local item = CRAFTER.getItemDetail(slot)
-        if item then
-            total = total + VAULT.pullItems(peripheral.getName(CRAFTER), slot)
-        end
+function store()
+    local n = 0
+    for _, s in ipairs(SLOTS.output) do
+        local item = CRAFTER.getItemDetail(s)
+        if item then n = n + VAULT.pullItems(peripheral.getName(CRAFTER), s) end
     end
-    
     if OUTPUT then
-        for slot = 1, OUTPUT.size() do
-            local item = OUTPUT.getItemDetail(slot)
-            if item then
-                total = total + VAULT.pullItems(peripheral.getName(OUTPUT), slot)
-            end
+        for s = 1, OUTPUT.size() do
+            local item = OUTPUT.getItemDetail(s)
+            if item then n = n + VAULT.pullItems(peripheral.getName(OUTPUT), s) end
         end
     end
-    
-    return total
+    return n
 end
 
-function isCrafting()
-    for _, slot in ipairs(SLOTS.output) do
-        if CRAFTER.getItemDetail(slot) then return true end
+function busy()
+    for _, s in ipairs(SLOTS.output) do
+        if CRAFTER.getItemDetail(s) then return true end
     end
     if OUTPUT then
-        for slot = 1, OUTPUT.size() do
-            if OUTPUT.getItemDetail(slot) then return true end
+        for s = 1, OUTPUT.size() do
+            if OUTPUT.getItemDetail(s) then return true end
         end
     end
     return false
 end
 
-function craft(recipeName)
-    local recipe = RECIPES[recipeName]
-    if not recipe then
-        print("❌ Рецепт не найден: " .. recipeName)
-        return false
-    end
+function craft(name)
+    local recipe = RECIPES[name]
+    if not recipe then print("❌ Нет рецепта: " .. name); return false end
     
-    print("=== Крафт: " .. recipeName .. " ===")
+    print("=== " .. name .. " ===")
     
-    local needs = recipeNeeds(recipe)
-    local ok, msg = vaultHas(needs)
-    if not ok then
-        print("❌ Недостаточно ресурсов: " .. msg)
-        return false
-    end
+    local ok, msg = check(needs(recipe))
+    if not ok then print("❌ " .. msg); return false end
     
-    clearCrafter()
+    clear()
     sleep(0.5)
     
     print("📦 Загрузка...")
-    if not loadRecipe(recipe) then return false end
+    if not loadR(recipe) then return false end
     
-    print("⚙️ Ожидание...")
-    local waitTime = 0
-    while waitTime < 30 do
+    print("⚙️ Ждём...")
+    local t = 0
+    while t < 30 do
         sleep(1)
-        waitTime = waitTime + 1
-        if isCrafting() then
-            print("✅ Готово за " .. waitTime .. " сек")
-            break
-        end
+        t = t + 1
+        if busy() then print("✅ Готово за " .. t .. "с"); break end
     end
     
     sleep(1)
-    local resultCount = storeOutput()
-    print(resultCount > 0 and ("✅ Получено: " .. resultCount) or "⚠️ Результат не найден!")
-    
-    clearCrafter()
-    return resultCount > 0
+    local n = store()
+    print(n > 0 and ("✅ " .. n .. " шт") or "⚠️ Ничего!")
+    clear()
+    return n > 0
 end
 
--- ========================================
--- ИНТЕРФЕЙС
--- ========================================
-
-function drawUI()
+-- === ИНТЕРФЕЙС ===
+function ui()
     if not MONITOR then return end
     MONITOR.clear()
-    MONITOR.setCursorPos(1, 1)
-    MONITOR.write("=== Create AE2 ===")
-    
-    MONITOR.setCursorPos(1, 2)
+    MONITOR.setCursorPos(1,1)
+    MONITOR.write("Create AE2")
+    MONITOR.setCursorPos(1,2)
     if #SLOTS.input == 0 then
-        MONITOR.write("❌ Нужна калибровка!")
-    elseif isCrafting() then
-        MONITOR.write("⚙️ Крафтинг...")
+        MONITOR.write("calibrate!")
+    elseif busy() then
+        MONITOR.write("работаю...")
     else
-        MONITOR.write("✅ Готов")
+        MONITOR.write("готов")
     end
-    
-    MONITOR.setCursorPos(1, 4)
-    MONITOR.write("Рецепты:")
-    local y = 5
-    for name, recipe in pairs(RECIPES) do
+    local y = 4
+    for name, r in pairs(RECIPES) do
         MONITOR.setCursorPos(1, y)
-        local short = recipe.result:gsub("minecraft:", ""):gsub("create:", "")
-        MONITOR.write("  " .. name .. " -> " .. short)
+        local short = r.result:gsub(".*:", "")
+        MONITOR.write(name .. " -> " .. short)
         y = y + 1
         if y > 18 then break end
     end
 end
 
--- ========================================
--- КОМАНДЫ
--- ========================================
-
+-- === КОМАНДЫ ===
 function list()
-    print("=== Vault ===")
     for name, count in pairs(vaultItems()) do
-        print("  " .. name .. ": " .. count)
+        print(name .. ": " .. count)
     end
 end
 
-function recipes()
-    print("=== Рецепты ===")
-    for name, recipe in pairs(RECIPES) do
-        print("  " .. name .. " -> " .. recipe.result)
+function showRecipes()
+    for name, r in pairs(RECIPES) do
+        print(name .. " -> " .. r.result)
     end
 end
 
-function deleteRecipe(name)
+function del(name)
     if RECIPES[name] then
         RECIPES[name] = nil
-        saveTable(RECIPES_FILE, RECIPES)
-        print("✅ Удалён: " .. name)
+        saveData(RECIPES_FILE, RECIPES)
+        print("✅ Удалён")
     else
-        print("❌ Не найден")
+        print("❌ Нет такого")
     end
 end
 
--- ========================================
--- АВТОРЕЖИМ
--- ========================================
-
-local QUEUE = {}
-
-function queue(name)
-    if not RECIPES[name] then
-        print("❌ Рецепт не существует")
-        return
-    end
-    table.insert(QUEUE, name)
-    print("📋 Добавлено: " .. name .. " (в очереди: " .. #QUEUE .. ")")
+-- === АВТО ===
+local Q = {}
+function q(name)
+    if not RECIPES[name] then print("❌ Нет рецепта"); return end
+    table.insert(Q, name)
+    print("📋 " .. name .. " (всего: " .. #Q .. ")")
 end
 
-function autoMode()
-    print("=== Авторежим ===")
+function auto()
     while true do
-        if #QUEUE > 0 and not isCrafting() then
-            craft(table.remove(QUEUE, 1))
+        if #Q > 0 and not busy() then
+            craft(table.remove(Q, 1))
         end
-        drawUI()
+        ui()
         sleep(2)
     end
 end
 
--- ========================================
--- ЗАПУСК
--- ========================================
+-- === ЗАПУСК ===
+print("=== Create AE2 ===")
+initSlots()
+initRecipes()
 
-function init()
-    print("=== Create AE2 Controller v3.1 ===")
-    
-    -- Загружаем конфиг с проверкой
-    local hasConfig = loadConfig()
-    if hasConfig then
-        print("✅ Конфиг: " .. #SLOTS.input .. " входных, " .. #SLOTS.output .. " выходных")
-    else
-        print("⚠️ Нет конфигурации! Введи calibrate()")
-    end
-    
-    -- Загружаем рецепты
-    local data = loadTable(RECIPES_FILE)
-    if data and type(data) == "table" then
-        RECIPES = data
-    else
-        RECIPES = {}
-    end
-    
-    local count = 0
-    for _ in pairs(RECIPES) do count = count + 1 end
-    print("✅ Рецептов: " .. count)
-    
-    print("\nКоманды:")
-    print("  calibrate()      — первая настройка")
-    print("  learnRecipe()    — обучить рецепт")
-    print("  craft('name')      — выполнить")
-    print("  recipes()          — список")
-    print("  list()             — инвентарь")
-    print("  queue('name')      — в очередь")
-    print("  autoMode()         — автовыполнение")
-    print("  deleteRecipe('n')  — удалить")
+print("Вход: " .. #SLOTS.input .. ", Выход: " .. #SLOTS.output)
+local n = 0; for _ in pairs(RECIPES) do n = n + 1 end
+print("Рецептов: " .. n)
+
+if #SLOTS.input == 0 then
+    print("\n⚠️ Первый запуск! Введи: calibrate()")
 end
 
-init()
+print("\nКоманды: calibrate() learn() craft('name') list() showRecipes() q('name') auto() del('name')")
