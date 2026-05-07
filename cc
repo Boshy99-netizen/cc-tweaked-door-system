@@ -1,11 +1,17 @@
 -- ========================================
 -- ae2.lua — Create AE2 Kontroller
 -- Create 6.0+ | CC:Tweaked 1.117.1
+-- Wired Modem Network
 -- ========================================
 
-local VAULT = peripheral.wrap("create:item_vault_0")
-local CRAFTER = peripheral.wrap("create:mechanical_crafter_0")
-local OUTPUT = peripheral.wrap("right")
+-- Получаем имена устройств в сети модема
+local VAULT_NAME = "create:item_vault_0"
+local CRAFTER_NAME = "create:mechanical_crafter_0"
+local OUTPUT_NAME = "right"  -- или имя бочки в сети, например "minecraft:barrel_0"
+
+local VAULT = peripheral.wrap(VAULT_NAME)
+local CRAFTER = peripheral.wrap(CRAFTER_NAME)
+local OUTPUT = peripheral.wrap(OUTPUT_NAME)
 local MONITOR = peripheral.find("monitor")
 
 local KONFIG_FILE = "ae2_slots.txt"
@@ -15,6 +21,45 @@ local SLOTS = {input = {}, output = {}}
 local RECEPTS = {}
 local OCHERED = {}
 local STATUS = "Ozhidaniye"
+
+-- === PROVERKA PODKLYuChENIYA ===
+function proverkaPeriferii()
+    print("=== PROVERKA SETI ===")
+    
+    -- Spisok vsekh ustroystv v seti
+    local devices = peripheral.getNames()
+    print("Ustroystva v seti:")
+    for _, name in ipairs(devices) do
+        print("  - " .. name)
+    end
+    
+    -- Proverka vault
+    if not VAULT then
+        print("OSHIbka: Vault '" .. VAULT_NAME .. "' ne nayden!")
+        print("Dostupnye vaulty:")
+        for _, name in ipairs(devices) do
+            if name:find("vault") then
+                print("  -> " .. name)
+            end
+        end
+        return false
+    end
+    
+    -- Proverka kraftra
+    if not CRAFTER then
+        print("OSHIbka: Kraftr '" .. CRAFTER_NAME .. "' ne nayden!")
+        print("Dostupnye kraftry:")
+        for _, name in ipairs(devices) do
+            if name:find("crafter") then
+                print("  -> " .. name)
+            end
+        end
+        return false
+    end
+    
+    print("OK: Vse ustroystva podklyucheny!")
+    return true
+end
 
 -- === FAYLY ===
 function loadData(filename)
@@ -74,17 +119,18 @@ function kalibrovka()
     local total = CRAFTER.size()
     print("Slotov: " .. total)
     
-    -- Chistim kraftr
+    -- Chistim kraftr — otpravlyaem v vault po imeni
     for i = 1, total do
         local item = CRAFTER.getItemDetail(i)
         if item then
-            CRAFTER.pushItems(peripheral.getName(VAULT), i)
+            -- Ot kraftra v vault: pushItems(targetName, sourceSlot, count, targetSlot)
+            CRAFTER.pushItems(VAULT_NAME, i)
         end
     end
     
     SLOTS = {input = {}, output = {}}
     
-    -- Test: ishem palochku v vault
+    -- Ishem palochku v vault
     local stickSlot = nil
     for i = 1, VAULT.size() do
         local item = VAULT.getItemDetail(i)
@@ -100,8 +146,8 @@ function kalibrovka()
         return false
     end
     
-    -- Kladom v kraftr (arg #2 = slot istochnika v vault, arg #4 = slot naznacheniya v kraftr)
-    local moved = VAULT.pushItems(peripheral.getName(CRAFTER), stickSlot, 1, 1)
+    -- Kladom v kraftr: iz vault v kraftr
+    local moved = VAULT.pushItems(CRAFTER_NAME, stickSlot, 1, 1)
     
     if moved == 0 then
         STATUS = "OSHIbka: Ne udalos polozhit!"
@@ -115,7 +161,8 @@ function kalibrovka()
         if item and item.name == "minecraft:stick" then
             table.insert(SLOTS.input, i)
             print("  Vkhodnoy slot: " .. i)
-            CRAFTER.pushItems(peripheral.getName(VAULT), i)
+            -- Zabiraem obratno v vault
+            CRAFTER.pushItems(VAULT_NAME, i)
         end
     end
     
@@ -237,12 +284,12 @@ end
 function chistkaKraftra()
     for _, s in ipairs(SLOTS.input) do
         if CRAFTER.getItemDetail(s) then
-            CRAFTER.pushItems(peripheral.getName(VAULT), s)
+            CRAFTER.pushItems(VAULT_NAME, s)
         end
     end
     for _, s in ipairs(SLOTS.output) do
         if CRAFTER.getItemDetail(s) then
-            CRAFTER.pushItems(peripheral.getName(VAULT), s)
+            CRAFTER.pushItems(VAULT_NAME, s)
         end
     end
 end
@@ -255,7 +302,8 @@ function zagruzitRecept(recept)
         for vSlot = 1, VAULT.size() do
             local vItem = VAULT.getItemDetail(vSlot)
             if vItem and vItem.name == item then
-                local moved = VAULT.pushItems(peripheral.getName(CRAFTER), vSlot, 1, slot)
+                -- Iz vault v kraftr
+                local moved = VAULT.pushItems(CRAFTER_NAME, vSlot, 1, slot)
                 if moved > 0 then
                     found = true
                     break
@@ -274,12 +322,12 @@ function zabratRezultat()
     local n = 0
     for _, s in ipairs(SLOTS.output) do
         local item = CRAFTER.getItemDetail(s)
-        if item then n = n + CRAFTER.pushItems(peripheral.getName(VAULT), s) end
+        if item then n = n + CRAFTER.pushItems(VAULT_NAME, s) end
     end
     if OUTPUT then
         for s = 1, OUTPUT.size() do
             local item = OUTPUT.getItemDetail(s)
-            if item then n = n + OUTPUT.pushItems(peripheral.getName(VAULT), s) end
+            if item then n = n + OUTPUT.pushItems(VAULT_NAME, s) end
         end
     end
     return n
@@ -543,6 +591,13 @@ end
 -- === GLAVNAYA ===
 function main()
     print("=== Create AE2 ===")
+    
+    -- Proverka podklyucheniya
+    if not proverkaPeriferii() then
+        print("\nProver imena ustroystv i podklyuchi modem!")
+        return
+    end
+    
     initSlots()
     initRecepts()
     
