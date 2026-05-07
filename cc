@@ -1,17 +1,28 @@
 -- ========================================
 -- ae2.lua — Create AE2 Kontroller
--- Create 6.0+ | CC:Tweaked 1.117.1
--- Wired Modem Network
+-- Auto-detektsiya ustroystv v seti
 -- ========================================
 
--- Получаем имена устройств в сети модема
-local VAULT_NAME = "create:item_vault_0"
-local CRAFTER_NAME = "create:mechanical_crafter_0"
-local OUTPUT_NAME = "right"  -- или имя бочки в сети, например "minecraft:barrel_0"
+-- === AUTO-DETEKTSIYA IMYON ===
+function naytiUstroystvo(pattern)
+    local names = peripheral.getNames()
+    for _, name in ipairs(names) do
+        if name:find(pattern) then
+            return name
+        end
+    end
+    return nil
+end
 
-local VAULT = peripheral.wrap(VAULT_NAME)
-local CRAFTER = peripheral.wrap(CRAFTER_NAME)
-local OUTPUT = peripheral.wrap(OUTPUT_NAME)
+-- Avtoopredeleniye imyon
+local VAULT_NAME = naytiUstroystvo("item_vault")
+local CRAFTER_NAME = naytiUstroystvo("mechanical_crafter")
+local OUTPUT_NAME = naytiUstroystvo("barrel") or naytiUstroystvo("chest")
+
+-- Periferiya
+local VAULT = VAULT_NAME and peripheral.wrap(VAULT_NAME) or nil
+local CRAFTER = CRAFTER_NAME and peripheral.wrap(CRAFTER_NAME) or nil
+local OUTPUT = OUTPUT_NAME and peripheral.wrap(OUTPUT_NAME) or nil
 local MONITOR = peripheral.find("monitor")
 
 local KONFIG_FILE = "ae2_slots.txt"
@@ -22,42 +33,30 @@ local RECEPTS = {}
 local OCHERED = {}
 local STATUS = "Ozhidaniye"
 
--- === PROVERKA PODKLYuChENIYA ===
-function proverkaPeriferii()
-    print("=== PROVERKA SETI ===")
-    
-    -- Spisok vsekh ustroystv v seti
-    local devices = peripheral.getNames()
-    print("Ustroystva v seti:")
-    for _, name in ipairs(devices) do
+-- === PROVERKA ===
+function proverkaSeti()
+    print("=== USTROYSTVA V SETI ===")
+    local names = peripheral.getNames()
+    for _, name in ipairs(names) do
         print("  - " .. name)
     end
     
-    -- Proverka vault
+    print("\n=== NAIDENNYE ===")
+    print("Vault:    " .. (VAULT_NAME or "NE NAYDEN"))
+    print("Kraftr:   " .. (CRAFTER_NAME or "NE NAYDEN"))
+    print("Vykhod:   " .. (OUTPUT_NAME or "ne nayden (neobyazatelno)"))
+    print("Monitor:  " .. (MONITOR and "OK" or "ne nayden"))
+    
     if not VAULT then
-        print("OSHIbka: Vault '" .. VAULT_NAME .. "' ne nayden!")
-        print("Dostupnye vaulty:")
-        for _, name in ipairs(devices) do
-            if name:find("vault") then
-                print("  -> " .. name)
-            end
-        end
+        print("\nOSHIbka: Vault ne nayden!")
         return false
     end
-    
-    -- Proverka kraftra
     if not CRAFTER then
-        print("OSHIbka: Kraftr '" .. CRAFTER_NAME .. "' ne nayden!")
-        print("Dostupnye kraftry:")
-        for _, name in ipairs(devices) do
-            if name:find("crafter") then
-                print("  -> " .. name)
-            end
-        end
+        print("\nOSHIbka: Kraftr ne nayden!")
         return false
     end
     
-    print("OK: Vse ustroystva podklyucheny!")
+    print("\nOK: Vse podklyucheno!")
     return true
 end
 
@@ -119,11 +118,10 @@ function kalibrovka()
     local total = CRAFTER.size()
     print("Slotov: " .. total)
     
-    -- Chistim kraftr — otpravlyaem v vault po imeni
+    -- Chistim kraftr
     for i = 1, total do
         local item = CRAFTER.getItemDetail(i)
         if item then
-            -- Ot kraftra v vault: pushItems(targetName, sourceSlot, count, targetSlot)
             CRAFTER.pushItems(VAULT_NAME, i)
         end
     end
@@ -141,32 +139,32 @@ function kalibrovka()
     end
     
     if not stickSlot then
-        STATUS = "OSHIbka: Net palochek v vault!"
+        STATUS = "OSHIbka: Net palochek!"
         print(STATUS)
         return false
     end
     
-    -- Kladom v kraftr: iz vault v kraftr
+    -- Kladom v kraftr
+    print("Peremeshcheniye iz " .. VAULT_NAME .. " v " .. CRAFTER_NAME)
     local moved = VAULT.pushItems(CRAFTER_NAME, stickSlot, 1, 1)
     
     if moved == 0 then
         STATUS = "OSHIbka: Ne udalos polozhit!"
-        print(STATUS)
+        print("Prover: kraftr pust? vault imeyet palochku?")
         return false
     end
     
-    -- Ishem palochku v kraftr
+    -- Ishem palochku
     for i = 1, total do
         local item = CRAFTER.getItemDetail(i)
         if item and item.name == "minecraft:stick" then
             table.insert(SLOTS.input, i)
             print("  Vkhodnoy slot: " .. i)
-            -- Zabiraem obratno v vault
             CRAFTER.pushItems(VAULT_NAME, i)
         end
     end
     
-    -- Ostalnye — vykhodnye
+    -- Ostalnye
     for i = 1, total do
         local found = false
         for _, v in ipairs(SLOTS.input) do if v == i then found = true end end
@@ -176,7 +174,7 @@ function kalibrovka()
     print("Vkhodnye: " .. #SLOTS.input .. ", Vykhodnye: " .. #SLOTS.output)
     saveData(KONFIG_FILE, SLOTS)
     
-    STATUS = "OK: Kalibrovka zavershena!"
+    STATUS = "OK: Kalibrovka!"
     print(STATUS)
     return true
 end
@@ -192,7 +190,7 @@ function obucheniye()
     STATUS = "Obucheniye..."
     drawUI()
     
-    print("Polozhi predmety V RUKU v kraftr, dozhdisya krafta, nazhmi Enter")
+    print("Polozhi predmety v kraftr, dozhdisya krafta, nazhmi Enter")
     read()
     
     local slots = {}
@@ -213,7 +211,7 @@ function obucheniye()
         return 
     end
     
-    -- Ishem rezultat
+    -- Rezultat
     local rezultat = nil
     for _, s in ipairs(SLOTS.output) do
         local item = CRAFTER.getItemDetail(s)
@@ -228,7 +226,7 @@ function obucheniye()
     end
     
     if not rezultat then
-        print("Vvedi rezultat v ruchnuyu:")
+        print("Vvedi rezultat:")
         rezultat = read()
         if rezultat == "" then 
             STATUS = "Otmeneno"
@@ -247,7 +245,7 @@ function obucheniye()
     RECEPTS[name] = {slots = slots, rezultat = rezultat}
     saveData(RECEPTS_FILE, RECEPTS)
     
-    STATUS = "OK: Recept '" .. name .. "' sohranen!"
+    STATUS = "OK: Recept sohranen!"
     print(STATUS)
     zabratRezultat()
 end
@@ -297,12 +295,10 @@ end
 function zagruzitRecept(recept)
     for slotStr, item in pairs(recept.slots) do
         local slot = tonumber(slotStr)
-        -- Ishem predmet v vault
         local found = false
         for vSlot = 1, VAULT.size() do
             local vItem = VAULT.getItemDetail(vSlot)
             if vItem and vItem.name == item then
-                -- Iz vault v kraftr
                 local moved = VAULT.pushItems(CRAFTER_NAME, vSlot, 1, slot)
                 if moved > 0 then
                     found = true
@@ -369,7 +365,7 @@ function kraft(name)
     
     print("Zagruzka...")
     if not zagruzitRecept(recept) then 
-        STATUS = "OSHIbka: Zagruzka neudachna!"
+        STATUS = "OSHIbka: Zagruzka!"
         return false 
     end
     
@@ -379,7 +375,7 @@ function kraft(name)
         sleep(1)
         t = t + 1
         if zanyat() then 
-            print("OK: Gotovo za " .. t .. "s")
+            print("OK: " .. t .. "s")
             break 
         end
     end
@@ -387,12 +383,11 @@ function kraft(name)
     sleep(1)
     local n = zabratRezultat()
     if n > 0 then
-        STATUS = "OK: Polucheno " .. n .. "x " .. recept.rezultat
-        print(STATUS)
+        STATUS = "OK: " .. n .. "x " .. recept.rezultat
     else
         STATUS = "VNIMANIYe: Nichego!"
-        print(STATUS)
     end
+    print(STATUS)
     
     chistkaKraftra()
     return n > 0
@@ -401,12 +396,12 @@ end
 -- === OCHERED ===
 function vOchered(name)
     if not RECEPTS[name] then 
-        STATUS = "OSHIbka: Net recepts '" .. name .. "'"
+        STATUS = "OSHIbka: Net recepts!"
         print(STATUS)
         return 
     end
     table.insert(OCHERED, name)
-    STATUS = "V ocheredi: " .. name .. " (" .. #OCHERED .. " vsego)"
+    STATUS = "Ochered: " .. name .. " (" .. #OCHERED .. ")"
     print(STATUS)
 end
 
@@ -418,7 +413,7 @@ function obrabotkaOcheredi()
 end
 
 function avtoRezhim()
-    STATUS = "Avto rezhim"
+    STATUS = "Avto"
     drawUI()
     while true do
         obrabotkaOcheredi()
@@ -427,7 +422,7 @@ function avtoRezhim()
     end
 end
 
--- === UI (MONITOR) ===
+-- === UI ===
 local KNOPKI = {}
 
 function drawKnopka(x, y, w, h, text, color, id)
@@ -439,55 +434,41 @@ function drawKnopka(x, y, w, h, text, color, id)
             MONITOR.write(" ")
         end
     end
-    
     MONITOR.setCursorPos(x + math.floor((w - #text) / 2), y + math.floor((h - 1) / 2))
     MONITOR.setTextColor(colors.white)
     MONITOR.write(text)
-    
     MONITOR.setBackgroundColor(oldColor)
-    
-    table.insert(KNOPKI, {
-        x = x, y = y, w = w, h = h, 
-        id = id or text
-    })
+    table.insert(KNOPKI, {x = x, y = y, w = w, h = h, id = id or text})
 end
 
 function drawUI()
     if not MONITOR then return end
-    
     KNOPKI = {}
-    
     MONITOR.setBackgroundColor(colors.black)
     MONITOR.clear()
     
-    -- Zagolovok
     MONITOR.setTextColor(colors.cyan)
     MONITOR.setCursorPos(1, 1)
     MONITOR.write("=== CREATE AE2 ===")
     
-    -- Status
     MONITOR.setTextColor(colors.yellow)
     MONITOR.setCursorPos(1, 2)
     MONITOR.write("Status: " .. STATUS)
     
-    -- Info
     MONITOR.setTextColor(colors.lightGray)
     MONITOR.setCursorPos(1, 3)
     local rc = 0; for _ in pairs(RECEPTS) do rc = rc + 1 end
     MONITOR.write("Sloty: V" .. #SLOTS.input .. " Vy" .. #SLOTS.output .. " | Recepty: " .. rc)
     
-    -- Ochered
     MONITOR.setTextColor(colors.pink)
     MONITOR.setCursorPos(1, 4)
     MONITOR.write("Ochered: " .. #OCHERED)
     
-    -- Glavnye knopki
     drawKnopka(1, 6, 8, 3, "KALIB", colors.blue, "kalibrovka")
     drawKnopka(10, 6, 8, 3, "OBUCH", colors.green, "obucheniye")
     drawKnopka(19, 6, 8, 3, "AVTO", colors.orange, "avto")
     drawKnopka(28, 6, 8, 3, "CHIST", colors.red, "chistka")
     
-    -- Recepty
     MONITOR.setTextColor(colors.white)
     MONITOR.setCursorPos(1, 10)
     MONITOR.write("=== RECEPTY ===")
@@ -496,29 +477,21 @@ function drawUI()
     local x = 1
     for name, recept in pairs(RECEPTS) do
         if y > 18 then break end
-        
         local short = recept.rezultat:gsub(".*:", "")
         local label = name .. ">" .. short
-        
         drawKnopka(x, y, 18, 2, label, colors.purple, "kraft:" .. name)
-        
         x = x + 19
-        if x > 30 then
-            x = 1
-            y = y + 3
-        end
+        if x > 30 then x = 1; y = y + 3 end
     end
     
-    -- Podskazka
     MONITOR.setTextColor(colors.gray)
     MONITOR.setCursorPos(1, 19)
-    MONITOR.write("Nazhmi knopku dlya upravleniya")
+    MONITOR.write("Nazhmi knopku")
 end
 
 function obrabotkaKnopki(x, y)
     for _, btn in ipairs(KNOPKI) do
-        if x >= btn.x and x < btn.x + btn.w 
-           and y >= btn.y and y < btn.y + btn.h then
+        if x >= btn.x and x < btn.x + btn.w and y >= btn.y and y < btn.y + btn.h then
             return btn.id
         end
     end
@@ -526,10 +499,8 @@ function obrabotkaKnopki(x, y)
 end
 
 function runKomanda(cmd)
-    if cmd == "kalibrovka" then
-        kalibrovka()
-    elseif cmd == "obucheniye" then
-        obucheniye()
+    if cmd == "kalibrovka" then kalibrovka()
+    elseif cmd == "obucheniye" then obucheniye()
     elseif cmd == "avto" then
         parallel.waitForAny(
             function()
@@ -563,7 +534,7 @@ function runKomanda(cmd)
     drawUI()
 end
 
--- === KOMANDY (terminal) ===
+-- === KOMANDY ===
 function spisok()
     for name, count in pairs(vaultItems()) do
         print(name .. ": " .. count)
@@ -592,9 +563,8 @@ end
 function main()
     print("=== Create AE2 ===")
     
-    -- Proverka podklyucheniya
-    if not proverkaPeriferii() then
-        print("\nProver imena ustroystv i podklyuchi modem!")
+    if not proverkaSeti() then
+        print("\nProver podklyucheniye modemov!")
         return
     end
     
@@ -606,7 +576,7 @@ function main()
     print("Receptov: " .. n)
     
     if #SLOTS.input == 0 then
-        print("\nPervyy zapusk! Nazhmi KALIB na monitore ili vvedi 'kalibrovka'")
+        print("\nPervyy zapusk! Nazhmi KALIB na monitore")
     end
     
     drawUI()
@@ -630,27 +600,16 @@ function main()
                 for word in input:gmatch("%S+") do table.insert(args, word) end
                 
                 if #args == 0 then
-                    -- pusto
-                elseif args[1] == "kalibrovka" then
-                    kalibrovka()
-                elseif args[1] == "obucheniye" then
-                    obucheniye()
-                elseif args[1] == "kraft" and args[2] then
-                    kraft(args[2])
-                elseif args[1] == "spisok" then
-                    spisok()
-                elseif args[1] == "recepty" then
-                    pokazatRecepty()
-                elseif args[1] == "q" and args[2] then
-                    vOchered(args[2])
-                elseif args[1] == "avto" then
-                    avtoRezhim()
-                elseif args[1] == "udalit" and args[2] then
-                    udalit(args[2])
-                elseif args[1] == "vykhod" then
-                    break
-                else
-                    print("Neizvestno: " .. args[1])
+                elseif args[1] == "kalibrovka" then kalibrovka()
+                elseif args[1] == "obucheniye" then obucheniye()
+                elseif args[1] == "kraft" and args[2] then kraft(args[2])
+                elseif args[1] == "spisok" then spisok()
+                elseif args[1] == "recepty" then pokazatRecepty()
+                elseif args[1] == "q" and args[2] then vOchered(args[2])
+                elseif args[1] == "avto" then avtoRezhim()
+                elseif args[1] == "udalit" and args[2] then udalit(args[2])
+                elseif args[1] == "vykhod" then break
+                else print("Neizvestno: " .. args[1])
                 end
                 
                 drawUI()
