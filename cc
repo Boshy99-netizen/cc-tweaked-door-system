@@ -15,7 +15,6 @@ local SLOTS = {input = {}, output = {}}
 local RECEPTS = {}
 local OCHERED = {}
 local STATUS = "Ozhidaniye"
-local LAST_MSG = ""
 
 -- === FAYLY ===
 function loadData(filename)
@@ -79,30 +78,43 @@ function kalibrovka()
     for i = 1, total do
         local item = CRAFTER.getItemDetail(i)
         if item then
-            -- Peremeshchaem v vault (ispolzuem pull s drugoy storony)
             CRAFTER.pushItems(peripheral.getName(VAULT), i)
         end
     end
     
     SLOTS = {input = {}, output = {}}
     
-    -- Test: kladom palochku v kraftr
-    local testSlot = 1
-    local moved = VAULT.pushItems(peripheral.getName(CRAFTER), testSlot, 1)
+    -- Test: ishem palochku v vault
+    local stickSlot = nil
+    for i = 1, VAULT.size() do
+        local item = VAULT.getItemDetail(i)
+        if item and item.name == "minecraft:stick" then
+            stickSlot = i
+            break
+        end
+    end
     
-    if moved == 0 then
+    if not stickSlot then
         STATUS = "OSHIbka: Net palochek v vault!"
         print(STATUS)
         return false
     end
     
-    -- Ishem palochku
+    -- Kladom v kraftr (arg #2 = slot istochnika v vault, arg #4 = slot naznacheniya v kraftr)
+    local moved = VAULT.pushItems(peripheral.getName(CRAFTER), stickSlot, 1, 1)
+    
+    if moved == 0 then
+        STATUS = "OSHIbka: Ne udalos polozhit!"
+        print(STATUS)
+        return false
+    end
+    
+    -- Ishem palochku v kraftr
     for i = 1, total do
         local item = CRAFTER.getItemDetail(i)
         if item and item.name == "minecraft:stick" then
             table.insert(SLOTS.input, i)
             print("  Vkhodnoy slot: " .. i)
-            -- Zabiraem obratno
             CRAFTER.pushItems(peripheral.getName(VAULT), i)
         end
     end
@@ -238,7 +250,7 @@ end
 function zagruzitRecept(recept)
     for slotStr, item in pairs(recept.slots) do
         local slot = tonumber(slotStr)
-        -- Ishem predmet v vault i peremeshchaem v nuzhnyy slot kraftra
+        -- Ishem predmet v vault
         local found = false
         for vSlot = 1, VAULT.size() do
             local vItem = VAULT.getItemDetail(vSlot)
@@ -369,7 +381,6 @@ end
 
 -- === UI (MONITOR) ===
 local KNOPKI = {}
-local RECEPT_KNOPKI = {}
 
 function drawKnopka(x, y, w, h, text, color, id)
     local oldColor = MONITOR.getBackgroundColor()
@@ -397,7 +408,6 @@ function drawUI()
     if not MONITOR then return end
     
     KNOPKI = {}
-    RECEPT_KNOPKI = {}
     
     MONITOR.setBackgroundColor(colors.black)
     MONITOR.clear()
