@@ -1,14 +1,15 @@
 -- ============================================
--- GUEST/CLAN KEY v10.0 — ELECTRONIC PASS
--- Select type: Guest (1 door) or Team/Clan (both doors)
+-- GUEST/CLAN KEY v11.0 — ELECTRONIC PASS
+-- Choose type: Guest (1 door) or Team/Clan (both doors, ignores LOCK)
+-- + Modem auto-recovery
 -- ============================================
 
-local INTERVAL = 1
-local KEY_CHANNEL = 100
+local INTERVAL      = 1
+local KEY_CHANNEL   = 100
 local REPLY_CHANNEL = 101
 
 -- ============================================
--- SETUP
+-- INIT
 -- ============================================
 
 local playerName = settings.get("key_owner")
@@ -19,33 +20,28 @@ if not playerName then
     settings.save()
 end
 
--- Select key type (Guest or Team)
 local keyType = settings.get("key_type")
 if not keyType then
-    term.clear()
-    term.setCursorPos(1, 1)
+    term.clear(); term.setCursorPos(1, 1)
     print("=== SELECT PASS TYPE ===")
     print("")
-    print("1. GUEST — Opens one door only")
-    print("   (closest door to you)")
+    print("1. GUEST  -- opens one door only")
+    print("            (the closest door)")
     print("")
-    print("2. TEAM / CLAN — Opens both doors")
-    print("   (full access like owner)")
+    print("2. TEAM   -- opens both doors,")
+    print("            works while base is")
+    print("            LOCKED (full access)")
     print("")
     print("Select 1 or 2:")
-    
+
     while true do
         local choice = read()
         if choice == "1" then
             keyType = "guest"
-            settings.set("key_type", keyType)
-            settings.save()
-            break
+            settings.set("key_type", keyType); settings.save(); break
         elseif choice == "2" then
             keyType = "team"
-            settings.set("key_type", keyType)
-            settings.save()
-            break
+            settings.set("key_type", keyType); settings.save(); break
         else
             print("Invalid! Enter 1 or 2:")
         end
@@ -53,172 +49,229 @@ if not keyType then
 end
 
 -- ============================================
--- MODEM SETUP
+-- MODEM (with auto-recovery)
+-- This is the fix for "key sometimes needs reload to open doors":
+-- if the modem peripheral handle goes stale (chunk unload, dim change,
+-- pocket re-equip), we re-resolve it instead of silently dropping pings.
 -- ============================================
 
-local modem = peripheral.find("modem")
+local modem = nil
+local modemName = nil
+
+local function resolveModem()
+    modem = peripheral.find("modem")
+    if modem then
+        modemName = peripheral.getName(modem)
+        pcall(modem.open, REPLY_CHANNEL)
+    else
+        modemName = nil
+    end
+end
+
+local function safeTransmit(ch, replyCh, payload)
+    if not modem then resolveModem() end
+    if not modem then return false end
+    local ok = pcall(modem.transmit, ch, replyCh, payload)
+    if not ok then
+        modem = nil
+        modemName = nil
+        resolveModem()
+        if modem then
+            pcall(modem.transmit, ch, replyCh, payload)
+        end
+    end
+    return ok
+end
+
+resolveModem()
 if not modem then
     print("ERROR: No wireless modem!")
     return
 end
 
-local modemName = peripheral.getName(modem)
-modem.open(REPLY_CHANNEL)
-
 -- ============================================
--- DRAW FUNCTIONS
+-- BASE STATE (received via BASE_STATUS)
 -- ============================================
 
-function clearScreen()
+local baseLocked = nil
+local lastBaseAt = nil
+
+-- ============================================
+-- DRAW
+-- ============================================
+
+local function clearScreen()
     term.setBackgroundColor(colors.black)
     term.clear()
     term.setCursorPos(1, 1)
 end
 
-function drawFrame()
+local function drawFrame()
     local w, h = term.getSize()
+    term.setBackgroundColor(colors.black)
     term.setTextColor(colors.gray)
-    
-    -- Corners
-    term.setCursorPos(1, 1)
-    write("+")
-    term.setCursorPos(w, 1)
-    write("+")
-    term.setCursorPos(1, h)
-    write("+")
-    term.setCursorPos(w, h)
-    write("+")
-    
-    -- Borders
+    term.setCursorPos(1, 1); term.write("+")
+    term.setCursorPos(w, 1); term.write("+")
+    term.setCursorPos(1, h); term.write("+")
+    term.setCursorPos(w, h); term.write("+")
     for x = 2, w - 1 do
-        term.setCursorPos(x, 1)
-        write("=")
-        term.setCursorPos(x, h)
-        write("=")
+        term.setCursorPos(x, 1); term.write("=")
+        term.setCursorPos(x, h); term.write("=")
     end
     for y = 2, h - 1 do
-        term.setCursorPos(1, y)
-        write("|")
-        term.setCursorPos(w, y)
-        write("|")
+        term.setCursorPos(1, y); term.write("|")
+        term.setCursorPos(w, y); term.write("|")
     end
 end
 
-function drawHeader(title)
+local function drawHeader(title, bg)
+    bg = bg or colors.gray
     local w = term.getSize()
-    term.setBackgroundColor(colors.gray)
+    term.setBackgroundColor(bg)
     term.setTextColor(colors.white)
     for x = 2, w - 1 do
-        term.setCursorPos(x, 2)
-        write(" ")
+        term.setCursorPos(x, 2); term.write(" ")
     end
-    local x = math.floor((w - #title) / 2) + 1
-    term.setCursorPos(x, 2)
-    write(title)
+    term.setCursorPos(math.floor((w - #title) / 2) + 1, 2)
+    term.write(title)
     term.setBackgroundColor(colors.black)
 end
 
+local function centerWrite(y, text, color)
+    local w = term.getSize()
+    if color then term.setTextColor(color) end
+    term.setCursorPos(math.floor((w - #text) / 2) + 1, y)
+    term.write(text)
+end
+
 -- ============================================
--- MAIN PAGE — ELECTRONIC PASS
+-- PASS PAGE
 -- ============================================
 
-function drawPass()
+local function drawPass()
     clearScreen()
     drawFrame()
-    
-    local typeText = (keyType == "team") and "  TEAM PASS  " or "  GUEST PASS  "
-    drawHeader(typeText)
-    
+
     local w, h = term.getSize()
-    local cx = math.floor(w / 2)
-    
-    -- Pass icon (different for guest vs team)
+    local title = (keyType == "team") and "  TEAM PASS  " or "  GUEST PASS  "
+    drawHeader(title, (keyType == "team") and colors.purple or colors.blue)
+
     if keyType == "team" then
-        -- Crown icon for team
+        -- Crown icon
         term.setTextColor(colors.yellow)
-        term.setCursorPos(cx - 3, 4)
-        write("  .-.  ")
-        term.setCursorPos(cx - 3, 5)
-        write(" /   \\ ")
-        term.setCursorPos(cx - 3, 6)
-        write("(  |  )")
-        term.setCursorPos(cx - 3, 7)
-        write(" \\___/ ")
+        centerWrite(4, "  .---.  ", colors.yellow)
+        centerWrite(5, " /\\ | /\\ ")
+        centerWrite(6, "(  \\|/  )")
+        centerWrite(7, " '-----' ")
     else
-        -- Card icon for guest
+        -- Card icon
         term.setTextColor(colors.lightBlue)
-        term.setCursorPos(cx - 3, 4)
-        write(" +---+ ")
-        term.setCursorPos(cx - 3, 5)
-        write(" |   | ")
-        term.setCursorPos(cx - 3, 6)
-        write(" | o | ")
-        term.setCursorPos(cx - 3, 7)
-        write(" +---+ ")
+        centerWrite(4, " +-----+ ", colors.lightBlue)
+        centerWrite(5, " |     | ")
+        centerWrite(6, " |  o  | ")
+        centerWrite(7, " +-----+ ")
     end
-    
-    -- Player name
-    term.setTextColor(colors.white)
-    term.setCursorPos(cx - math.floor(#playerName / 2), 9)
-    write(playerName)
-    
-    -- Access level
+
+    centerWrite(9, playerName, colors.white)
+
     if keyType == "team" then
-        term.setTextColor(colors.yellow)
-        term.setCursorPos(cx - 3, 11)
-        write("[TEAM]")
+        centerWrite(10, "[ TEAM ]", colors.yellow)
     else
-        term.setTextColor(colors.lightBlue)
-        term.setCursorPos(cx - 3, 11)
-        write("[GUEST]")
+        centerWrite(10, "[ GUEST ]", colors.lightBlue)
     end
-    
-    -- Time at the bottom
+
+    -- Base status (informational)
+    term.setTextColor(colors.gray)
+    term.setCursorPos(3, 13); term.write("Base: ")
+    if baseLocked == nil then
+        term.setTextColor(colors.gray);  term.write("...")
+    elseif baseLocked then
+        term.setTextColor(colors.red);   term.write("LOCKED")
+        if keyType == "guest" then
+            term.setTextColor(colors.gray)
+            term.setCursorPos(3, 14); term.write("(guests denied)")
+        end
+    else
+        term.setTextColor(colors.lime);  term.write("OPEN  ")
+    end
+
+    -- Real time at the bottom
     term.setTextColor(colors.lightGray)
-    local timeStr = textutils.formatTime(os.time(), false)
-    term.setCursorPos(cx - math.floor(#timeStr / 2), h - 1)
-    write(timeStr)
+    local timeStr = textutils.formatTime(os.time("local"), true)
+    centerWrite(h - 1, timeStr, colors.lightGray)
+end
+
+local function refreshTimeBar()
+    local w, h = term.getSize()
+    -- Clear time row
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.lightGray)
+    for x = 2, w - 1 do
+        term.setCursorPos(x, h - 1); term.write(" ")
+    end
+    local timeStr = textutils.formatTime(os.time("local"), true)
+    term.setCursorPos(math.floor((w - #timeStr) / 2) + 1, h - 1)
+    term.write(timeStr)
 end
 
 -- ============================================
 -- MAIN LOOP
 -- ============================================
 
-function mainLoop()
+local function mainLoop()
     clearScreen()
-    print("=== GUEST KEY v10.0 ===")
-    print("Electronic Pass System")
+    print("=== KEY v11.0 ===")
     print("Player: " .. playerName)
-    print("Type: " .. ((keyType == "team") and "TEAM (Full Access)" or "GUEST (Single Door)"))
+    print("Type: " .. ((keyType == "team") and "TEAM" or "GUEST"))
     print("")
     print("Loading...")
-    sleep(1)
-    
+    sleep(0.5)
+
     drawPass()
-    
+
     local timerId = os.startTimer(INTERVAL)
-    
+
     while true do
-        local event = {os.pullEventRaw()}
-        
-        if event[1] == "timer" and event[2] == timerId then
-            -- Send ping with type
-            modem.transmit(KEY_CHANNEL, REPLY_CHANNEL, {
-                type = "KEY_PING",
-                keyType = keyType,  -- "guest" or "team"
-                player = playerName,
-                timestamp = os.time()
+        local event = { os.pullEventRaw() }
+        local ev = event[1]
+
+        if ev == "timer" and event[2] == timerId then
+            -- Send KEY_PING
+            safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
+                type      = "KEY_PING",
+                keyType   = keyType,
+                player    = playerName,
+                timestamp = os.time(),
             })
-            
-            -- Update time at bottom
-            term.setTextColor(colors.lightGray)
-            local timeStr = textutils.formatTime(os.time(), false)
-            local w, h = term.getSize()
-            local cx = math.floor(w / 2)
-            term.setCursorPos(cx - math.floor(#timeStr / 2), h - 1)
-            write(timeStr)
-            
+            -- Soft refresh of the time line
+            refreshTimeBar()
             timerId = os.startTimer(INTERVAL)
+
+        elseif ev == "modem_message" then
+            local message = event[5]
+            if type(message) == "table" and message.type == "BASE_STATUS" then
+                local prev = baseLocked
+                baseLocked = message.locked
+                lastBaseAt = os.epoch("utc")
+                if prev ~= baseLocked then
+                    drawPass()
+                end
+            end
+
+        elseif ev == "peripheral" then
+            if event[2] then
+                local ok, pType = pcall(peripheral.getType, event[2])
+                if ok and pType == "modem" then
+                    resolveModem()
+                end
+            end
+
+        elseif ev == "peripheral_detach" then
+            if event[2] == modemName then
+                modem = nil
+                modemName = nil
+                resolveModem()
+            end
         end
     end
 end
