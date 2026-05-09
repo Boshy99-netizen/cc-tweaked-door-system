@@ -1,56 +1,43 @@
 -- ============================================
--- OWNER KEY v11.0 — ELECTRONIC PASS
--- 3-tab UI (HOME / GUESTS / SERVER) + modem auto-recovery
+-- OWNER TABLET v12.0
+-- Full base management: doors CRUD, ACL, pads, hardware setup.
 -- ============================================
 
-local TICK_INTERVAL = 1     -- KEY_PING send interval
-local PING_INTERVAL = 2     -- ping round-trip every Ns
-local KEY_CHANNEL   = 100
-local REPLY_CHANNEL = 101
+local KEY_CHANNEL    = 100
+local REPLY_CHANNEL  = 101
+local PING_INTERVAL  = 1
+local RTT_INTERVAL   = 2
 
--- ============================================
--- INIT
--- ============================================
+-- ============================================ INIT ============================================
 
 local playerName = settings.get("key_owner")
 if not playerName then
     term.clear(); term.setCursorPos(1, 1)
     print("Enter your Minecraft name:")
     playerName = read()
-    settings.set("key_owner", playerName)
-    settings.save()
+    settings.set("key_owner", playerName); settings.save()
 end
 
--- ============================================
--- MODEM (with auto-recovery)
--- Stale modem refs are the #1 reason keys "stop working" until reload.
--- We re-resolve on every transmit failure and on peripheral events.
--- ============================================
+-- ============================================ MODEM (auto-recovery) ============================================
 
-local modem = nil
-local modemName = nil
+local modem, modemName = nil, nil
 
 local function resolveModem()
     modem = peripheral.find("modem")
     if modem then
         modemName = peripheral.getName(modem)
         pcall(modem.open, REPLY_CHANNEL)
-    else
-        modemName = nil
-    end
+    else modemName = nil end
 end
 
-local function safeTransmit(ch, replyCh, payload)
+local function safeTransmit(payload)
     if not modem then resolveModem() end
     if not modem then return false end
-    local ok = pcall(modem.transmit, ch, replyCh, payload)
+    local ok = pcall(modem.transmit, KEY_CHANNEL, REPLY_CHANNEL, payload)
     if not ok then
-        modem = nil
-        modemName = nil
+        modem, modemName = nil, nil
         resolveModem()
-        if modem then
-            pcall(modem.transmit, ch, replyCh, payload)
-        end
+        if modem then pcall(modem.transmit, KEY_CHANNEL, REPLY_CHANNEL, payload) end
     end
     return ok
 end
@@ -62,44 +49,43 @@ if not modem then
     return
 end
 
--- ============================================
--- STATE
--- ============================================
+-- ============================================ STATE ============================================
 
-local currentPage = "home"
-local buttons = {}
+local screen = "home"  -- home, doors, door_detail, door_users, door_user_edit, door_pwds, door_pwd_input, hardware, server, picker, input
+local stack  = {}      -- screen stack for back navigation; entries: {screen, ctx}
+local ctx    = {}      -- per-screen context (e.g. selected doorId, edit field)
+local buttons = {}     -- action -> {x1,y1,x2,y2}
 
--- Base info (received via BASE_STATUS / PING_REPLY)
-local baseLocked   = nil
-local baseTps      = nil
-local baseGameTime = nil
-local baseGameDay  = nil
-local lastBaseAt   = nil
+-- Base info
+local baseLocked, baseOwner = nil, nil
+local baseTps, baseGameTime, baseGameDay = nil, nil, nil
+local baseDoorsSummary = {}     -- light list for HOME/DOORS
+local baseDoorsFull = {}        -- detailed list with users/pwds (when on detail screens)
+local periList = { relays = {}, modems = {}, monitors = {}, statusMonitor = nil }
 
--- Ping measurement
-local pingNonce   = 0
-local pingPending = {}
-local lastPingMs  = nil
+-- Round-trip ping
+local pingNonce, pingPending, lastPingMs = 0, {}, nil
 
--- Guest list (received from base)
-local guestList     = {}
-local guestInput    = ""
-local guestInputMode = false
+-- Command tracking (reliable delivery)
+local cmdNonce, cmdPending = 0, {}
+local cmdStatus, cmdMessage, cmdShownUntil = nil, nil, 0
 
--- ============================================
--- DRAW HELPERS
--- ============================================
+-- Modal/input state
+local inputBuf = ""
+local inputCfg = nil  -- {title, prompt, onSubmit, allowChars, max, hidden}
 
-local function clearScreen()
-    term.setBackgroundColor(colors.black)
-    term.clear()
-    term.setCursorPos(1, 1)
-end
+-- Generic option picker
+local pickerCfg = nil  -- {title, options=[{label,value}], onPick}
+
+-- ============================================ TERM HELPERS ============================================
+
+local function setBg(c) term.setBackgroundColor(c) end
+local function setFg(c) term.setTextColor(c) end
+local function clearScreen() setBg(colors.black); term.clear(); term.setCursorPos(1,1) end
 
 local function drawFrame()
     local w, h = term.getSize()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.gray)
+    setBg(colors.black); setFg(colors.gray)
     term.setCursorPos(1, 1); term.write("+")
     term.setCursorPos(w, 1); term.write("+")
     term.setCursorPos(1, h); term.write("+")
@@ -114,392 +100,845 @@ local function drawFrame()
     end
 end
 
-local function drawHeader(title)
+local function drawHeader(title, color)
+    color = color or colors.gray
     local w = term.getSize()
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
-    for x = 2, w - 1 do
-        term.setCursorPos(x, 2); term.write(" ")
-    end
+    setBg(color); setFg(colors.white)
+    for x = 2, w - 1 do term.setCursorPos(x, 2); term.write(" ") end
     term.setCursorPos(math.floor((w - #title) / 2) + 1, 2)
     term.write(title)
-    term.setBackgroundColor(colors.black)
+    setBg(colors.black)
 end
 
 local function centerWrite(y, text, color)
     local w = term.getSize()
-    if color then term.setTextColor(color) end
+    if color then setFg(color) end
     term.setCursorPos(math.floor((w - #text) / 2) + 1, y)
     term.write(text)
 end
 
 local function drawBtn(x, y, text, bg, fg, action)
-    term.setBackgroundColor(bg)
-    term.setTextColor(fg)
-    term.setCursorPos(x, y)
-    term.write(text)
-    term.setBackgroundColor(colors.black)
+    setBg(bg); setFg(fg)
+    term.setCursorPos(x, y); term.write(text)
+    setBg(colors.black)
     if action then
         buttons[action] = { x1 = x, y1 = y, x2 = x + #text - 1, y2 = y }
     end
 end
 
--- ============================================
--- NAV BAR (bottom 2 rows: separator + tabs)
--- ============================================
+local function drawBackBtn(action)
+    action = action or "back"
+    local _, h = term.getSize()
+    drawBtn(2, h - 1, "[< BACK]", colors.gray, colors.white, action)
+end
 
-local function drawNavBar()
-    local w, h = term.getSize()
+local function trunc(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return s:sub(1, n - 1) .. "."
+end
 
-    -- separator on h-2
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.gray)
-    term.setCursorPos(1, h - 2); term.write("+")
-    for x = 2, w - 1 do
-        term.setCursorPos(x, h - 2); term.write("-")
-    end
-    term.setCursorPos(w, h - 2); term.write("+")
+-- ============================================ NETWORK ============================================
 
-    local tabs = {
-        { key = "home",   label = " HOME ", act = "nav_home" },
-        { key = "guests", label = "GUESTS", act = "nav_guests" },
-        { key = "server", label = "SERVER", act = "nav_server" },
+local function setCmdStatus(status, message)
+    cmdStatus, cmdMessage = status, message
+    if status == "sending" then cmdShownUntil = os.epoch("utc") + 30000
+    else cmdShownUntil = os.epoch("utc") + 3000 end
+end
+
+local function sendCommand(cmd, data, label)
+    cmdNonce = cmdNonce + 1
+    local n = cmdNonce
+    local payload = {
+        type = "OWNER_COMMAND", nonce = n,
+        player = playerName, command = cmd, data = data,
     }
-
-    local totalW = w - 2
-    local tabW = math.floor(totalW / 3)
-    local extra = totalW - 3 * tabW
-
-    local x = 2
-    for i, t in ipairs(tabs) do
-        local tw = tabW + (i == 1 and extra or 0)
-        local active = (currentPage == t.key)
-        local bg = active and colors.yellow or colors.gray
-        local fg = active and colors.black or colors.white
-
-        local pad = tw - #t.label
-        local leftPad = math.floor(pad / 2)
-        local rightPad = pad - leftPad
-        local s = string.rep(" ", leftPad) .. t.label .. string.rep(" ", rightPad)
-
-        term.setBackgroundColor(bg)
-        term.setTextColor(fg)
-        term.setCursorPos(x, h - 1)
-        term.write(s)
-
-        buttons[t.act] = { x1 = x, y1 = h - 1, x2 = x + tw - 1, y2 = h - 1 }
-        x = x + tw
-    end
-    term.setBackgroundColor(colors.black)
-end
-
--- ============================================
--- HOME — Electronic Pass + lock control
--- ============================================
-
-local function drawHomePage()
-    clearScreen()
-    drawFrame()
-    drawHeader(" ELECTRONIC PASS ")
-    buttons = {}
-
-    local w, h = term.getSize()
-
-    -- Diamond icon (yellow)
-    term.setTextColor(colors.yellow)
-    centerWrite(4, "  /\\  ", colors.yellow)
-    centerWrite(5, " /  \\ ")
-    centerWrite(6, "<    >")
-    centerWrite(7, " \\  / ")
-    centerWrite(8, "  \\/  ")
-
-    -- Player name + status
-    centerWrite(10, playerName, colors.white)
-    centerWrite(11, "[OWNER]", colors.lime)
-
-    -- Base status row
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 13); term.write("Base: ")
-    if baseLocked == nil then
-        term.setTextColor(colors.gray);  term.write("Connecting...")
-    elseif baseLocked then
-        term.setTextColor(colors.red);   term.write("LOCKED       ")
-    else
-        term.setTextColor(colors.lime);  term.write("OPEN         ")
-    end
-
-    -- Lock/unlock button
-    local btnText = baseLocked and "[ UNLOCK BASE ]" or "[  LOCK BASE  ]"
-    local btnBg   = baseLocked and colors.red or colors.purple
-    local btnX = math.floor((w - #btnText) / 2) + 1
-    drawBtn(btnX, 15, btnText, btnBg, colors.white, "toggle_lock")
-
-    drawNavBar()
-end
-
--- ============================================
--- GUESTS — list + add/remove
--- ============================================
-
-local function drawGuestsPage()
-    clearScreen()
-    drawFrame()
-    drawHeader(" GUEST LIST ")
-    buttons = {}
-
-    local w, h = term.getSize()
-
-    -- Total
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 4); term.write("Total: ")
-    term.setTextColor(colors.white); term.write(tostring(#guestList))
-
-    -- List rows 6..14 (max 9)
-    local maxRows = 9
-    if #guestList == 0 then
-        term.setTextColor(colors.gray)
-        centerWrite(8, "(no guests yet)", colors.gray)
-    else
-        for i = 1, math.min(#guestList, maxRows) do
-            local y = 5 + i
-            local name = guestList[i]
-            local maxNameLen = w - 9
-            local display = name
-            if #display > maxNameLen then
-                display = display:sub(1, maxNameLen - 1) .. "."
-            end
-            term.setTextColor(colors.yellow)
-            term.setCursorPos(3, y); term.write(display)
-            drawBtn(w - 5, y, "[X]", colors.red, colors.white, "remove_" .. name)
-        end
-    end
-
-    -- Add button
-    local btnText = "[ + ADD GUEST ]"
-    local btnX = math.floor((w - #btnText) / 2) + 1
-    drawBtn(btnX, 16, btnText, colors.green, colors.white, "add_guest")
-
-    drawNavBar()
-end
-
-local function drawGuestInput()
-    local w, h = term.getSize()
-    -- Modal box rows 8..14
-    term.setBackgroundColor(colors.black)
-    for y = 8, 14 do
-        for x = 3, w - 2 do
-            term.setCursorPos(x, y); term.write(" ")
-        end
-    end
-    term.setTextColor(colors.gray)
-    for x = 3, w - 2 do
-        term.setCursorPos(x, 8);  term.write("-")
-        term.setCursorPos(x, 14); term.write("-")
-    end
-    for y = 8, 14 do
-        term.setCursorPos(3, y);    term.write("|")
-        term.setCursorPos(w - 2, y); term.write("|")
-    end
-    term.setCursorPos(3, 8);     term.write("+")
-    term.setCursorPos(w - 2, 8); term.write("+")
-    term.setCursorPos(3, 14);    term.write("+")
-    term.setCursorPos(w - 2, 14);term.write("+")
-
-    centerWrite(10, "Enter guest name:", colors.white)
-
-    local inp = "> " .. guestInput .. "_"
-    if #inp > w - 6 then
-        inp = "> ..." .. guestInput:sub(-(w - 12)) .. "_"
-    end
-    term.setTextColor(colors.yellow)
-    term.setCursorPos(5, 12); term.write(inp)
-
-    centerWrite(13, "Enter=save  Esc=cancel", colors.gray)
-end
-
--- ============================================
--- SERVER — TPS, ping, time, day/night
--- ============================================
-
-local function tpsColor(tps)
-    if tps == nil then return colors.gray end
-    if tps >= 19   then return colors.lime end
-    if tps >= 15   then return colors.yellow end
-    if tps >= 10   then return colors.orange end
-    return colors.red
-end
-
-local function pingColor(ms)
-    if ms == nil then return colors.gray end
-    if ms <= 60    then return colors.lime end
-    if ms <= 200   then return colors.yellow end
-    if ms <= 500   then return colors.orange end
-    return colors.red
-end
-
-local function drawProgressBar(x, y, width, value, vmax, color)
-    local filled = math.floor((width * value) / vmax + 0.5)
-    if filled < 0 then filled = 0 end
-    if filled > width then filled = width end
-
-    term.setCursorPos(x, y)
-    term.setBackgroundColor(color)
-    term.write(string.rep(" ", filled))
-    term.setBackgroundColor(colors.gray)
-    term.write(string.rep(" ", width - filled))
-    term.setBackgroundColor(colors.black)
-end
-
-local function formatGameTime(t)
-    if t == nil then return "--:--" end
-    local h = math.floor(t)
-    local m = math.floor((t - h) * 60)
-    return string.format("%02d:%02d", h, m)
-end
-
-local function isDay(t)
-    if t == nil then return nil end
-    return t >= 6.0 and t < 18.0
-end
-
-local function drawServerPage()
-    clearScreen()
-    drawFrame()
-    drawHeader(" SERVER STATUS ")
-    buttons = {}
-
-    local w, h = term.getSize()
-
-    -- ========= TPS =========
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 4); term.write("TPS")
-    local tpsStr = baseTps and string.format("%.1f", baseTps) or " -- "
-    term.setTextColor(tpsColor(baseTps))
-    term.setCursorPos(w - 1 - #tpsStr, 4); term.write(tpsStr)
-    drawProgressBar(3, 5, w - 4, baseTps or 0, 20, tpsColor(baseTps))
-
-    -- ========= PING =========
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 7); term.write("PING")
-    local pingStr = lastPingMs and (tostring(lastPingMs) .. " ms") or " -- "
-    term.setTextColor(pingColor(lastPingMs))
-    term.setCursorPos(w - 1 - #pingStr, 7); term.write(pingStr)
-    local pingPct = lastPingMs and math.min(500, lastPingMs) or 0
-    drawProgressBar(3, 8, w - 4, pingPct, 500, pingColor(lastPingMs))
-
-    -- separator
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.gray)
-    for x = 3, w - 2 do
-        term.setCursorPos(x, 10); term.write(".")
-    end
-
-    -- ========= TIME =========
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 11); term.write("Day")
-    if baseGameDay then
-        term.setTextColor(colors.white)
-        local s = tostring(baseGameDay)
-        term.setCursorPos(w - 1 - #s, 11); term.write(s)
-    else
-        term.setTextColor(colors.gray)
-        term.setCursorPos(w - 3, 11); term.write("--")
-    end
-
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 12); term.write("Time")
-    term.setTextColor(colors.white)
-    local timeStr = formatGameTime(baseGameTime)
-    term.setCursorPos(w - 1 - #timeStr, 12); term.write(timeStr)
-
-    local day = isDay(baseGameTime)
-    if day == true then
-        term.setTextColor(colors.yellow)
-        term.setCursorPos(3, 13); term.write("(*)  DAYTIME    ")
-    elseif day == false then
-        term.setTextColor(colors.lightBlue)
-        term.setCursorPos(3, 13); term.write("(C)  NIGHTTIME  ")
-    else
-        term.setTextColor(colors.gray)
-        term.setCursorPos(3, 13); term.write("...  unknown    ")
-    end
-
-    -- Real local time
-    term.setTextColor(colors.gray)
-    term.setCursorPos(3, 15); term.write("Real")
-    term.setTextColor(colors.lightGray)
-    local realTime = textutils.formatTime(os.time("local"), true)
-    term.setCursorPos(w - 1 - #realTime, 15); term.write(realTime)
-
-    drawNavBar()
-end
-
--- ============================================
--- DISPATCH
--- ============================================
-
-local function drawCurrentPage()
-    if currentPage == "home" then
-        drawHomePage()
-    elseif currentPage == "guests" then
-        drawGuestsPage()
-    elseif currentPage == "server" then
-        drawServerPage()
-    end
-    if guestInputMode then
-        drawGuestInput()
-    end
-end
-
--- ============================================
--- NETWORK
--- ============================================
-
-local function sendCommand(cmd, data)
-    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
-        type    = "OWNER_COMMAND",
-        player  = playerName,
-        command = cmd,
-        data    = data,
-    })
+    cmdPending[n] = { payload = payload, sentAt = os.epoch("utc"), retries = 0, label = label or cmd }
+    safeTransmit(payload)
+    setCmdStatus("sending", label or cmd)
 end
 
 local function sendKeyPing()
-    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
-        type      = "KEY_PING",
-        keyType   = "owner",
-        player    = playerName,
-        timestamp = os.time(),
-    })
+    safeTransmit({ type = "KEY_PING", keyType = "owner", player = playerName, timestamp = os.time() })
 end
 
 local function sendPingRequest()
     pingNonce = pingNonce + 1
     local n = pingNonce
     pingPending[n] = os.epoch("utc")
-    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
-        type   = "PING_REQUEST",
-        nonce  = n,
-        player = playerName,
-    })
-    -- Cleanup pending older than 5s
+    safeTransmit({ type = "PING_REQUEST", nonce = n, player = playerName })
     local now = os.epoch("utc")
-    for k, v in pairs(pingPending) do
-        if now - v > 5000 then pingPending[k] = nil end
+    for k, v in pairs(pingPending) do if now - v > 5000 then pingPending[k] = nil end end
+end
+
+local function requestDoors()
+    safeTransmit({ type = "REQUEST_DOORS", player = playerName })
+end
+
+local function requestPeripherals()
+    safeTransmit({ type = "REQUEST_PERIPHERALS", player = playerName })
+end
+
+-- ============================================ NAV ============================================
+
+local drawCurrent  -- forward decl
+
+local function pushScreen(s, c)
+    table.insert(stack, { screen = screen, ctx = ctx })
+    screen = s
+    ctx = c or {}
+    if s == "doors" or s == "door_detail" or s == "door_users" or s == "door_pwds" then
+        requestDoors()
+    end
+    if s == "hardware" or s == "doors" or s == "door_detail" then
+        requestPeripherals()
+    end
+    drawCurrent()
+end
+
+local function popScreen()
+    local prev = table.remove(stack)
+    if prev then screen, ctx = prev.screen, prev.ctx
+    else screen, ctx = "home", {} end
+    drawCurrent()
+end
+
+-- ============================================ NAVIGATION BAR ============================================
+
+local function drawNavBar()
+    local w, h = term.getSize()
+    setBg(colors.black); setFg(colors.gray)
+    term.setCursorPos(1, h - 2); term.write("+")
+    for x = 2, w - 1 do term.setCursorPos(x, h - 2); term.write("-") end
+    term.setCursorPos(w, h - 2); term.write("+")
+
+    local tabs = {
+        { key = "home",     label = "HOME",  act = "nav_home" },
+        { key = "doors",    label = "DOORS", act = "nav_doors" },
+        { key = "hardware", label = "HW",    act = "nav_hw" },
+        { key = "server",   label = "SRV",   act = "nav_server" },
+    }
+    -- "doors" tab also highlights when on door_detail/users/pwds/door_user_edit/door_pwd_input
+    local activeKey = screen
+    if screen == "door_detail" or screen == "door_users" or screen == "door_pwds"
+        or screen == "door_user_edit" or screen == "door_pwd_input" then
+        activeKey = "doors"
+    end
+
+    local totalW = w - 2
+    local tabW = math.floor(totalW / #tabs)
+    local extra = totalW - tabW * #tabs
+    local x = 2
+    for i, t in ipairs(tabs) do
+        local tw = tabW + (i == 1 and extra or 0)
+        local active = (activeKey == t.key)
+        local bg = active and colors.yellow or colors.gray
+        local fg = active and colors.black or colors.white
+        local pad = tw - #t.label
+        local lp = math.floor(pad / 2); local rp = pad - lp
+        local s = string.rep(" ", lp) .. t.label .. string.rep(" ", rp)
+        if #s > tw then s = s:sub(1, tw) end
+        setBg(bg); setFg(fg)
+        term.setCursorPos(x, h - 1); term.write(s)
+        buttons[t.act] = { x1 = x, y1 = h - 1, x2 = x + tw - 1, y2 = h - 1 }
+        x = x + tw
+    end
+    setBg(colors.black)
+end
+
+local function drawCmdStatus(y)
+    if not cmdStatus then return end
+    local w = term.getSize()
+    local txt, color
+    if cmdStatus == "sending" then txt = "... " .. (cmdMessage or ""); color = colors.yellow
+    elseif cmdStatus == "ok" then txt = "OK: " .. (cmdMessage or ""); color = colors.lime
+    else txt = "FAIL: " .. (cmdMessage or "?"); color = colors.red end
+    if #txt > w - 4 then txt = txt:sub(1, w - 4) end
+    centerWrite(y, txt, color)
+end
+
+-- ============================================ HOME ============================================
+
+local function drawHome()
+    clearScreen(); drawFrame(); drawHeader(" ELECTRONIC PASS ")
+    buttons = {}
+    local w, h = term.getSize()
+
+    setFg(colors.yellow)
+    centerWrite(4, "  /\\  ")
+    centerWrite(5, " /  \\ ")
+    centerWrite(6, "<    >")
+    centerWrite(7, " \\  / ")
+    centerWrite(8, "  \\/  ")
+
+    centerWrite(10, playerName, colors.white)
+    centerWrite(11, "[OWNER]", colors.lime)
+
+    -- Owner-on-base check
+    if baseOwner ~= nil and baseOwner == "" then
+        centerWrite(13, "Base unclaimed!", colors.yellow)
+        local btn = "[ CLAIM THIS BASE ]"
+        drawBtn(math.floor((w - #btn) / 2) + 1, 15, btn, colors.lime, colors.black, "claim_owner")
+    elseif baseOwner ~= nil and not (string.lower(baseOwner) == string.lower(playerName)) then
+        centerWrite(13, "Owner: " .. baseOwner, colors.red)
+        centerWrite(14, "(not you)", colors.gray)
+    else
+        setFg(colors.gray); term.setCursorPos(3, 13); term.write("Base: ")
+        if baseLocked == nil then setFg(colors.gray); term.write("...")
+        elseif baseLocked then setFg(colors.red); term.write("LOCKED")
+        else setFg(colors.lime); term.write("OPEN") end
+
+        local txt = baseLocked and "[ UNLOCK BASE ]" or "[  LOCK BASE  ]"
+        local bg  = baseLocked and colors.red or colors.purple
+        drawBtn(math.floor((w - #txt) / 2) + 1, 15, txt, bg, colors.white, "toggle_lock")
+        drawCmdStatus(16)
+    end
+
+    drawNavBar()
+end
+
+-- ============================================ DOORS LIST ============================================
+
+local function drawDoors()
+    clearScreen(); drawFrame(); drawHeader(" DOORS ")
+    buttons = {}
+    local w, h = term.getSize()
+    local y = 4
+    if #baseDoorsSummary == 0 then
+        centerWrite(6, "(no doors yet)", colors.gray)
+        centerWrite(7, "Tap [+ ADD] below.", colors.lightGray)
+    else
+        for _, d in ipairs(baseDoorsSummary) do
+            if y >= h - 5 then break end
+            local nm = trunc(d.name, w - 14)
+            setFg(colors.white)
+            term.setCursorPos(2, y); term.write(nm)
+            local statusTxt = d.open and "OPEN" or "CLOSE"
+            local color = d.open and colors.lime or colors.red
+            if not d.enabled then statusTxt = "OFF"; color = colors.gray end
+            setFg(color)
+            term.setCursorPos(w - 13, y); term.write(statusTxt)
+            drawBtn(w - 7, y, "[EDIT]", colors.blue, colors.white, "edit_" .. d.id)
+            y = y + 1
+        end
+    end
+
+    drawBtn(2, h - 4, " [+ ADD DOOR] ", colors.green, colors.white, "add_door")
+    drawCmdStatus(h - 3)
+    drawNavBar()
+end
+
+-- Find full door by id
+local function findFullDoor(id)
+    for _, d in ipairs(baseDoorsFull) do
+        if d.id == id then return d end
+    end
+    return nil
+end
+
+-- ============================================ DOOR DETAIL ============================================
+
+local SIDES = { "top", "bottom", "left", "right", "front", "back" }
+
+local function drawDoorDetail()
+    clearScreen(); drawFrame()
+    local id = ctx.doorId
+    local d = findFullDoor(id)
+    if not d then drawHeader(" DOOR ... ") else drawHeader(" " .. trunc(d.name, 18) .. " ") end
+    buttons = {}
+    local w, h = term.getSize()
+
+    if not d then
+        centerWrite(6, "Loading door info...", colors.gray)
+        drawNavBar(); drawBackBtn("back")
+        return
+    end
+
+    local function row(y, label, val, action, valColor)
+        setFg(colors.lightGray); term.setCursorPos(2, y); term.write(label)
+        setFg(valColor or colors.white)
+        local sx = 9
+        local maxLen = w - sx - 8
+        local s = trunc(val, maxLen)
+        term.setCursorPos(sx, y); term.write(s)
+        if action then
+            drawBtn(w - 7, y, "[EDIT]", colors.blue, colors.white, action)
+        end
+    end
+
+    row(4,  "Name:",   d.name,                                          "edit_name")
+    row(5,  "Relay:",  d.relay ~= "" and d.relay or "(none)",           "edit_relay")
+    row(6,  "Side:",   d.relaySide,                                     "edit_side")
+    row(7,  "Modem:",  d.modem ~= "" and d.modem or "(none)",           "edit_modem")
+    row(8,  "Radius:", tostring(d.radius),                              "edit_radius")
+    row(9,  "InvRly:", d.normallyOn and "yes" or "no",                  "edit_invert")
+    row(10, "Enabled:",d.enabled and "yes" or "no",                     "edit_enabled")
+    row(11, "Pad:",    d.padMonitor and d.padMonitor or "(none)",       "edit_pad")
+    row(12, "Users:",  tostring(#(d.users or {})), nil)
+    drawBtn(w - 7, 12, "[OPEN]", colors.gray, colors.white, "go_users")
+    row(13, "Pwds:",   tostring(d.passwordCount or 0), nil)
+    drawBtn(w - 7, 13, "[OPEN]", colors.gray, colors.white, "go_pwds")
+
+    -- Open/close right from detail
+    if d.open then
+        drawBtn(2, h - 5, " [CLOSE] ", colors.red, colors.white, "door_close")
+    else
+        drawBtn(2, h - 5, " [OPEN]  ", colors.green, colors.white, "door_open")
+    end
+    drawBtn(12, h - 5, " [DELETE] ", colors.red, colors.white, "delete_door")
+
+    drawCmdStatus(h - 4)
+    drawBackBtn("back")
+    drawNavBar()
+end
+
+-- ============================================ USERS LIST ============================================
+
+local function drawDoorUsers()
+    clearScreen(); drawFrame()
+    local id = ctx.doorId
+    local d = findFullDoor(id)
+    drawHeader(" " .. (d and trunc(d.name, 14) or "...") .. " - USERS ")
+    buttons = {}
+    local w, h = term.getSize()
+
+    if not d then
+        centerWrite(6, "Loading...", colors.gray)
+        drawBackBtn("back"); drawNavBar(); return
+    end
+
+    local y = 4
+    if not d.users or #d.users == 0 then
+        centerWrite(6, "(no users)", colors.gray)
+    else
+        for _, u in ipairs(d.users) do
+            if y >= h - 5 then break end
+            setFg(colors.white)
+            term.setCursorPos(2, y); term.write(trunc(u.name, w - 16))
+            local lvlColor = u.level == "team" and colors.yellow or colors.lightBlue
+            local lvlTxt   = u.level == "team" and "TEAM"        or "GUEST"
+            setFg(lvlColor)
+            term.setCursorPos(w - 13, y); term.write(lvlTxt)
+            drawBtn(w - 7, y, "[DEL]", colors.red, colors.white, "del_user_" .. u.name)
+            y = y + 1
+        end
+    end
+
+    drawBtn(2, h - 4, " [+ ADD USER] ", colors.green, colors.white, "add_user")
+    drawCmdStatus(h - 3)
+    drawBackBtn("back")
+    drawNavBar()
+end
+
+-- ============================================ PASSWORDS LIST ============================================
+
+local function drawDoorPwds()
+    clearScreen(); drawFrame()
+    local id = ctx.doorId
+    local d = findFullDoor(id)
+    drawHeader(" " .. (d and trunc(d.name, 14) or "...") .. " - PASSWORDS ")
+    buttons = {}
+    local w, h = term.getSize()
+
+    if not d then
+        centerWrite(6, "Loading...", colors.gray)
+        drawBackBtn("back"); drawNavBar(); return
+    end
+
+    local pwds = d.passwords or {}
+    local y = 4
+    if #pwds == 0 then
+        centerWrite(6, "(no passwords)", colors.gray)
+    else
+        for i, pw in ipairs(pwds) do
+            if y >= h - 5 then break end
+            setFg(colors.white)
+            term.setCursorPos(2, y); term.write("#" .. i .. ": ")
+            setFg(colors.yellow); term.write(pw)
+            drawBtn(w - 7, y, "[DEL]", colors.red, colors.white, "del_pwd_" .. pw)
+            y = y + 1
+        end
+    end
+
+    drawBtn(2, h - 4, " [+ ADD PWD] ", colors.green, colors.white, "add_pwd")
+    drawCmdStatus(h - 3)
+    drawBackBtn("back")
+    drawNavBar()
+end
+
+-- ============================================ HARDWARE ============================================
+
+local function drawHardware()
+    clearScreen(); drawFrame(); drawHeader(" HARDWARE ")
+    buttons = {}
+    local w, h = term.getSize()
+
+    setFg(colors.lightGray); term.setCursorPos(2, 4); term.write("Status monitor:")
+    setFg(colors.white); term.setCursorPos(2, 5)
+    term.write(periList.statusMonitor and trunc(periList.statusMonitor, w - 10) or "(none)")
+    drawBtn(w - 7, 5, "[EDIT]", colors.blue, colors.white, "edit_status_mon")
+
+    setFg(colors.lightGray); term.setCursorPos(2, 7); term.write("Available on base:")
+    setFg(colors.white); term.setCursorPos(2, 8)
+    term.write("Relays:   " .. #periList.relays)
+    term.setCursorPos(2, 9)
+    term.write("Modems:   " .. #periList.modems)
+    term.setCursorPos(2, 10)
+    term.write("Monitors: " .. #periList.monitors)
+
+    setFg(colors.gray); term.setCursorPos(2, 12); term.write("Tap REFRESH to reload")
+    setFg(colors.gray); term.setCursorPos(2, 13); term.write("the peripheral list.")
+
+    drawBtn(2, 15, " [REFRESH] ", colors.gray, colors.white, "refresh_peri")
+    drawBtn(2, 16, " [SET OWNER] ", colors.blue, colors.white, "set_owner")
+
+    drawCmdStatus(h - 3)
+    drawNavBar()
+end
+
+-- ============================================ SERVER ============================================
+
+local function tpsColor(t)
+    if t == nil then return colors.gray end
+    if t >= 19 then return colors.lime end
+    if t >= 15 then return colors.yellow end
+    if t >= 10 then return colors.orange end
+    return colors.red
+end
+
+local function pingColor(ms)
+    if ms == nil then return colors.gray end
+    if ms <= 80    then return colors.lime end
+    if ms <= 250   then return colors.yellow end
+    if ms <= 600   then return colors.orange end
+    return colors.red
+end
+
+local function drawBar(x, y, width, value, vmax, color)
+    local filled = math.floor((width * value) / vmax + 0.5)
+    if filled < 0 then filled = 0 end
+    if filled > width then filled = width end
+    term.setCursorPos(x, y)
+    setBg(color); term.write(string.rep(" ", filled))
+    setBg(colors.gray); term.write(string.rep(" ", width - filled))
+    setBg(colors.black)
+end
+
+local function fmtGameTime(t)
+    if not t then return "--:--" end
+    local hh = math.floor(t)
+    local mm = math.floor((t - hh) * 60)
+    return string.format("%02d:%02d", hh, mm)
+end
+
+local function isDay(t) if not t then return nil end; return t >= 6.0 and t < 18.0 end
+
+local function drawServer()
+    clearScreen(); drawFrame(); drawHeader(" SERVER ")
+    buttons = {}
+    local w, h = term.getSize()
+
+    setFg(colors.gray); term.setCursorPos(3, 4); term.write("TPS")
+    local tpsStr = baseTps and string.format("%.1f", baseTps) or "--"
+    setFg(tpsColor(baseTps))
+    term.setCursorPos(w - 1 - #tpsStr, 4); term.write(tpsStr)
+    drawBar(3, 5, w - 4, baseTps or 0, 20, tpsColor(baseTps))
+
+    setFg(colors.gray); term.setCursorPos(3, 7); term.write("PING")
+    local pStr = lastPingMs and (tostring(lastPingMs) .. " ms") or "--"
+    setFg(pingColor(lastPingMs))
+    term.setCursorPos(w - 1 - #pStr, 7); term.write(pStr)
+    drawBar(3, 8, w - 4, lastPingMs and math.min(600, lastPingMs) or 0, 600, pingColor(lastPingMs))
+
+    setFg(colors.gray)
+    for x = 3, w - 2 do term.setCursorPos(x, 10); term.write(".") end
+
+    setFg(colors.gray); term.setCursorPos(3, 11); term.write("Day")
+    if baseGameDay then
+        setFg(colors.white); local s = tostring(baseGameDay)
+        term.setCursorPos(w - 1 - #s, 11); term.write(s)
+    end
+    setFg(colors.gray); term.setCursorPos(3, 12); term.write("Time")
+    setFg(colors.white)
+    local ts = fmtGameTime(baseGameTime)
+    term.setCursorPos(w - 1 - #ts, 12); term.write(ts)
+
+    local d = isDay(baseGameTime)
+    if d == true then setFg(colors.yellow); term.setCursorPos(3, 13); term.write("(*)  DAYTIME    ")
+    elseif d == false then setFg(colors.lightBlue); term.setCursorPos(3, 13); term.write("(C)  NIGHTTIME  ")
+    else setFg(colors.gray); term.setCursorPos(3, 13); term.write("...  unknown    ") end
+
+    setFg(colors.gray); term.setCursorPos(3, 15); term.write("Real")
+    setFg(colors.lightGray)
+    local rt = textutils.formatTime(os.time("local"), true)
+    term.setCursorPos(w - 1 - #rt, 15); term.write(rt)
+
+    drawNavBar()
+end
+
+-- ============================================ MODALS: INPUT BOX & PICKER ============================================
+
+local function drawInputModal()
+    if not inputCfg then return end
+    local w, h = term.getSize()
+    local x1, x2 = 3, w - 2
+    local y1, y2 = 6, 14
+    setBg(colors.black)
+    for y = y1, y2 do for x = x1, x2 do term.setCursorPos(x, y); term.write(" ") end end
+    setFg(colors.gray)
+    for x = x1, x2 do term.setCursorPos(x, y1); term.write("-"); term.setCursorPos(x, y2); term.write("-") end
+    for y = y1, y2 do term.setCursorPos(x1, y); term.write("|"); term.setCursorPos(x2, y); term.write("|") end
+    term.setCursorPos(x1, y1); term.write("+"); term.setCursorPos(x2, y1); term.write("+")
+    term.setCursorPos(x1, y2); term.write("+"); term.setCursorPos(x2, y2); term.write("+")
+
+    centerWrite(y1 + 2, inputCfg.title or "Input", colors.white)
+    centerWrite(y1 + 3, inputCfg.prompt or "", colors.lightGray)
+
+    local shown = inputCfg.hidden and string.rep("*", #inputBuf) or inputBuf
+    local maxLen = w - 8
+    if #shown > maxLen then shown = "..." .. shown:sub(-(maxLen - 3)) end
+    setFg(colors.yellow)
+    term.setCursorPos(x1 + 2, y1 + 5); term.write("> " .. shown .. "_")
+    centerWrite(y2 - 1, "Enter=ok  Esc=cancel", colors.gray)
+end
+
+local function startInput(cfg)
+    inputCfg = cfg
+    inputBuf = cfg.initial or ""
+    drawInputModal()
+end
+
+local function endInput(submit)
+    if submit and inputCfg and inputCfg.onSubmit then
+        inputCfg.onSubmit(inputBuf)
+    end
+    inputCfg = nil
+    inputBuf = ""
+    drawCurrent()  -- redraw underlying screen
+end
+
+local function drawPickerModal()
+    if not pickerCfg then return end
+    local w, h = term.getSize()
+    local x1, x2 = 3, w - 2
+    local y1, y2 = 4, h - 3
+    setBg(colors.black)
+    for y = y1, y2 do for x = x1, x2 do term.setCursorPos(x, y); term.write(" ") end end
+    setFg(colors.gray)
+    for x = x1, x2 do term.setCursorPos(x, y1); term.write("-"); term.setCursorPos(x, y2); term.write("-") end
+    for y = y1, y2 do term.setCursorPos(x1, y); term.write("|"); term.setCursorPos(x2, y); term.write("|") end
+    term.setCursorPos(x1, y1); term.write("+"); term.setCursorPos(x2, y1); term.write("+")
+    term.setCursorPos(x1, y2); term.write("+"); term.setCursorPos(x2, y2); term.write("+")
+
+    centerWrite(y1 + 1, pickerCfg.title or "Select", colors.white)
+
+    buttons = {}  -- replace; only picker buttons matter while modal up
+    local visStart = pickerCfg.scroll or 0
+    local maxVis = y2 - y1 - 4
+    local opts = pickerCfg.options or {}
+    for i = 1, math.min(maxVis, #opts - visStart) do
+        local idx = i + visStart
+        local opt = opts[idx]
+        local label = trunc(opt.label, w - 8)
+        drawBtn(x1 + 2, y1 + 1 + i, " " .. label .. string.rep(" ", math.max(1, w - 7 - #label)) .. " ",
+                colors.gray, colors.white, "pick_" .. idx)
+    end
+    -- Scroll buttons if needed
+    if visStart > 0 then drawBtn(x2 - 4, y1 + 1, "[^]", colors.gray, colors.white, "pick_up") end
+    if visStart + maxVis < #opts then drawBtn(x2 - 4, y2 - 1, "[v]", colors.gray, colors.white, "pick_dn") end
+    drawBtn(x1 + 2, y2 - 1, "[CANCEL]", colors.red, colors.white, "pick_cancel")
+end
+
+local function startPicker(cfg)
+    pickerCfg = cfg
+    pickerCfg.scroll = 0
+    drawPickerModal()
+end
+
+local function endPicker(value)
+    local cb = pickerCfg and pickerCfg.onPick
+    pickerCfg = nil
+    if cb then cb(value) end
+    drawCurrent()
+end
+
+-- ============================================ DRAW DISPATCHER ============================================
+
+drawCurrent = function()
+    if screen == "home" then drawHome()
+    elseif screen == "doors" then drawDoors()
+    elseif screen == "door_detail" then drawDoorDetail()
+    elseif screen == "door_users" then drawDoorUsers()
+    elseif screen == "door_pwds" then drawDoorPwds()
+    elseif screen == "hardware" then drawHardware()
+    elseif screen == "server" then drawServer()
+    end
+    if inputCfg then drawInputModal() end
+    if pickerCfg then drawPickerModal() end
+end
+
+-- ============================================ ACTION HANDLERS ============================================
+
+local function navTab(key)
+    -- Drop the stack so going back from a tab doesn't reopen modal subscreens
+    stack = {}
+    if key == "home" then screen = "home"
+    elseif key == "doors" then screen = "doors"; requestDoors(); requestPeripherals()
+    elseif key == "hardware" then screen = "hardware"; requestPeripherals()
+    elseif key == "server" then screen = "server"; sendPingRequest()
+    end
+    ctx = {}
+    drawCurrent()
+end
+
+-- Helpers for door-add flow
+local pendingAddDoor = {}
+
+local function pickRelay(onPick)
+    local opts = {}
+    for _, n in ipairs(periList.relays) do table.insert(opts, { label = n, value = n }) end
+    if #opts == 0 then setCmdStatus("fail", "no relays found"); drawCurrent(); return end
+    startPicker({ title = "Pick relay", options = opts, onPick = onPick })
+end
+
+local function pickModem(onPick)
+    local opts = {}
+    for _, n in ipairs(periList.modems) do table.insert(opts, { label = n, value = n }) end
+    if #opts == 0 then setCmdStatus("fail", "no modems found"); drawCurrent(); return end
+    startPicker({ title = "Pick modem", options = opts, onPick = onPick })
+end
+
+local function pickMonitor(allowNone, onPick)
+    local opts = {}
+    if allowNone then table.insert(opts, { label = "(none)", value = "" }) end
+    for _, n in ipairs(periList.monitors) do table.insert(opts, { label = n, value = n }) end
+    if #opts == 0 then setCmdStatus("fail", "no monitors found"); drawCurrent(); return end
+    startPicker({ title = "Pick monitor", options = opts, onPick = onPick })
+end
+
+local function pickSide(onPick)
+    local opts = {}
+    for _, s in ipairs(SIDES) do table.insert(opts, { label = s, value = s }) end
+    startPicker({ title = "Relay side", options = opts, onPick = onPick })
+end
+
+local function startAddDoor()
+    pendingAddDoor = {}
+    -- Step 1: name
+    startInput({
+        title = "New door", prompt = "Name:", initial = "Door",
+        onSubmit = function(name)
+            if name == "" then return end
+            pendingAddDoor.name = name
+            -- Step 2: relay
+            pickRelay(function(relay)
+                if not relay then return end
+                pendingAddDoor.relay = relay
+                pickSide(function(side)
+                    if not side then return end
+                    pendingAddDoor.relaySide = side
+                    pickModem(function(modem)
+                        if not modem then return end
+                        pendingAddDoor.modem = modem
+                        startInput({
+                            title = "Radius", prompt = "Range in blocks", initial = "5",
+                            onSubmit = function(r)
+                                pendingAddDoor.radius = tonumber(r) or 5
+                                startPicker({
+                                    title = "Inverted relay?",
+                                    options = { { label = "no  (normal)", value = false },
+                                                { label = "yes (inverted)", value = true } },
+                                    onPick = function(inv)
+                                        if inv == nil then return end
+                                        pendingAddDoor.normallyOn = inv
+                                        sendCommand("door_add", pendingAddDoor, "add door")
+                                    end,
+                                })
+                            end,
+                        })
+                    end)
+                end)
+            end)
+        end,
+    })
+end
+
+local function handleAction(action)
+    -- Tab navigation always available
+    if action == "nav_home"   then navTab("home"); return end
+    if action == "nav_doors"  then navTab("doors"); return end
+    if action == "nav_hw"     then navTab("hardware"); return end
+    if action == "nav_server" then navTab("server"); return end
+    if action == "back"       then popScreen(); return end
+
+    -- Picker scroll/cancel (handled inside picker modal generically)
+    if pickerCfg then
+        if action == "pick_up" then
+            pickerCfg.scroll = math.max(0, (pickerCfg.scroll or 0) - 1)
+            drawPickerModal(); return
+        elseif action == "pick_dn" then
+            pickerCfg.scroll = (pickerCfg.scroll or 0) + 1
+            drawPickerModal(); return
+        elseif action == "pick_cancel" then
+            endPicker(nil); return
+        elseif action:sub(1, 5) == "pick_" then
+            local idx = tonumber(action:sub(6))
+            if idx and pickerCfg.options[idx] then
+                endPicker(pickerCfg.options[idx].value); return
+            end
+            return
+        end
+    end
+
+    -- HOME
+    if action == "claim_owner" then sendCommand("claim_owner", nil, "claim"); return end
+    if action == "toggle_lock" then
+        sendCommand("toggle_lock", nil, baseLocked and "unlock" or "lock")
+        if baseLocked == nil then baseLocked = false end
+        baseLocked = not baseLocked
+        drawCurrent(); return
+    end
+
+    -- DOORS list
+    if action == "add_door" then startAddDoor(); return end
+    if action:sub(1, 5) == "edit_" and screen == "doors" then
+        local id = action:sub(6); pushScreen("door_detail", { doorId = id }); return
+    end
+
+    -- DOOR DETAIL
+    if screen == "door_detail" then
+        local id = ctx.doorId
+        local d = findFullDoor(id)
+        if action == "door_open"  then sendCommand("door_open",  { id = id }, "open"); return end
+        if action == "door_close" then sendCommand("door_close", { id = id }, "close"); return end
+        if action == "delete_door" then
+            startPicker({
+                title = "Delete door?",
+                options = { { label = "Yes, delete", value = true }, { label = "Cancel", value = false } },
+                onPick = function(v)
+                    if v then
+                        sendCommand("door_remove", { id = id }, "delete")
+                        sleep(0.3); popScreen()
+                    end
+                end,
+            })
+            return
+        end
+        if action == "edit_name" then
+            startInput({ title = "Rename", prompt = "Door name:", initial = d and d.name or "",
+                onSubmit = function(v) if v ~= "" then sendCommand("door_update", { id = id, name = v }, "rename") end end })
+            return
+        end
+        if action == "edit_relay" then
+            pickRelay(function(v) if v then sendCommand("door_update", { id = id, relay = v }, "set relay") end end)
+            return
+        end
+        if action == "edit_side" then
+            pickSide(function(v) if v then sendCommand("door_update", { id = id, relaySide = v }, "set side") end end)
+            return
+        end
+        if action == "edit_modem" then
+            pickModem(function(v) if v then sendCommand("door_update", { id = id, modem = v }, "set modem") end end)
+            return
+        end
+        if action == "edit_radius" then
+            startInput({ title = "Radius", prompt = "Blocks:", initial = d and tostring(d.radius) or "5",
+                onSubmit = function(v) local n = tonumber(v); if n then sendCommand("door_update", { id = id, radius = n }, "set radius") end end })
+            return
+        end
+        if action == "edit_invert" then
+            sendCommand("door_update", { id = id, normallyOn = not (d and d.normallyOn) }, "toggle inv")
+            return
+        end
+        if action == "edit_enabled" then
+            sendCommand("door_update", { id = id, enabled = not (d and d.enabled) }, "toggle ena")
+            return
+        end
+        if action == "edit_pad" then
+            pickMonitor(true, function(v) if v ~= nil then sendCommand("door_set_pad", { id = id, monitor = v }, "set pad") end end)
+            return
+        end
+        if action == "go_users" then pushScreen("door_users", { doorId = id }); return end
+        if action == "go_pwds"  then pushScreen("door_pwds",  { doorId = id }); return end
+    end
+
+    -- USERS
+    if screen == "door_users" then
+        if action == "add_user" then
+            startInput({ title = "Add user", prompt = "Player name:",
+                onSubmit = function(name)
+                    if name == "" then return end
+                    startPicker({
+                        title = "Access level for " .. name,
+                        options = { { label = "GUEST (denied when LOCKED)", value = "guest" },
+                                    { label = "TEAM  (always allowed)",     value = "team"  } },
+                        onPick = function(lvl)
+                            if lvl then sendCommand("door_user_set", { id = ctx.doorId, user = name, level = lvl }, "add user") end
+                        end,
+                    })
+                end })
+            return
+        end
+        if action:sub(1, 9) == "del_user_" then
+            local nm = action:sub(10)
+            sendCommand("door_user_set", { id = ctx.doorId, user = nm, level = nil }, "del user")
+            return
+        end
+    end
+
+    -- PWDS
+    if screen == "door_pwds" then
+        if action == "add_pwd" then
+            startInput({ title = "Add password", prompt = "Digits/letters:", hidden = false,
+                onSubmit = function(p) if p ~= "" then sendCommand("door_pwd_add", { id = ctx.doorId, password = p }, "add pwd") end end })
+            return
+        end
+        if action:sub(1, 8) == "del_pwd_" then
+            local pw = action:sub(9)
+            sendCommand("door_pwd_remove", { id = ctx.doorId, password = pw }, "del pwd")
+            return
+        end
+    end
+
+    -- HARDWARE
+    if screen == "hardware" then
+        if action == "edit_status_mon" then
+            pickMonitor(true, function(v) if v ~= nil then sendCommand("set_status_monitor", { monitor = v }, "set status mon") end end)
+            return
+        end
+        if action == "refresh_peri" then requestPeripherals(); setCmdStatus("ok", "refreshed"); drawCurrent(); return end
+        if action == "set_owner" then
+            startInput({ title = "Set owner", prompt = "New owner name:", initial = baseOwner or "",
+                onSubmit = function(v) if v ~= "" then sendCommand("set_owner", { name = v }, "set owner") end end })
+            return
+        end
     end
 end
 
-local function requestGuests()
-    safeTransmit(KEY_CHANNEL, REPLY_CHANNEL, {
-        type    = "REQUEST_GUESTS",
-        player  = playerName,
-        keyType = "owner",
-    })
+-- ============================================ KEYBOARD INPUT ============================================
+
+local function handleKey(key)
+    if not inputCfg then return end
+    if key == keys.enter then endInput(true); return end
+    if key == keys.escape then endInput(false); return end
+    if key == keys.backspace then
+        if #inputBuf > 0 then inputBuf = inputBuf:sub(1, -2); drawInputModal() end
+        return
+    end
 end
 
--- ============================================
--- INPUT
--- ============================================
+local function handleChar(ch)
+    if not inputCfg or not ch or #ch == 0 then return end
+    local maxLen = inputCfg.max or 32
+    if #inputBuf >= maxLen then return end
+    local b = string.byte(ch)
+    if b >= 32 and b <= 126 then
+        inputBuf = inputBuf .. ch
+        drawInputModal()
+    end
+end
+
+-- ============================================ MAIN LOOP ============================================
 
 local function findClickedAction(x, y)
     for name, area in pairs(buttons) do
@@ -510,61 +949,20 @@ local function findClickedAction(x, y)
     return nil
 end
 
-local function navigateTo(page)
-    if currentPage == page then return end
-    currentPage = page
-    if page == "guests" then requestGuests() end
-    if page == "server" then sendPingRequest() end
-    drawCurrentPage()
-end
-
-local function handleAction(action)
-    if action == "nav_home"   then navigateTo("home");   return end
-    if action == "nav_guests" then navigateTo("guests"); return end
-    if action == "nav_server" then navigateTo("server"); return end
-
-    if action == "toggle_lock" then
-        sendCommand("toggle_lock")
-        if baseLocked == nil then baseLocked = false end
-        baseLocked = not baseLocked
-        drawCurrentPage()
-        return
-    end
-
-    if action == "add_guest" then
-        guestInputMode = true
-        guestInput = ""
-        drawGuestInput()
-        return
-    end
-
-    if action:sub(1, 7) == "remove_" then
-        local name = action:sub(8)
-        sendCommand("remove_guest", name)
-        sleep(0.3)
-        requestGuests()
-        return
-    end
-end
-
--- ============================================
--- MAIN LOOP
--- ============================================
-
 local function mainLoop()
     clearScreen()
-    print("=== OWNER KEY v11.0 ===")
+    print("=== OWNER TABLET v12 ===")
     print("Player: " .. playerName)
-    print("Loading...")
+    print("Connecting...")
     sleep(0.4)
 
-    drawCurrentPage()
-    requestGuests()
-    sendPingRequest()
+    drawCurrent()
+    sendKeyPing(); sendPingRequest()
+    requestPeripherals()
 
-    local pingTimer  = os.startTimer(TICK_INTERVAL)
-    local rttTimer   = os.startTimer(PING_INTERVAL)
-    local refreshTimer = os.startTimer(1)
+    local pingT = os.startTimer(PING_INTERVAL)
+    local rttT  = os.startTimer(RTT_INTERVAL)
+    local refrT = os.startTimer(0.5)
 
     while true do
         local event = { os.pullEventRaw() }
@@ -572,110 +970,110 @@ local function mainLoop()
 
         if ev == "timer" then
             local id = event[2]
-            if id == pingTimer then
-                sendKeyPing()
-                pingTimer = os.startTimer(TICK_INTERVAL)
-            elseif id == rttTimer then
-                sendPingRequest()
-                rttTimer = os.startTimer(PING_INTERVAL)
-            elseif id == refreshTimer then
-                -- refresh visible dynamic UI
-                if currentPage == "server" or currentPage == "home" then
-                    drawCurrentPage()
+            if id == pingT then sendKeyPing(); pingT = os.startTimer(PING_INTERVAL)
+            elseif id == rttT then sendPingRequest(); rttT = os.startTimer(RTT_INTERVAL)
+            elseif id == refrT then
+                -- Retry pending commands without ACK after 0.7s, max 3 retries
+                local now = os.epoch("utc")
+                for n, p in pairs(cmdPending) do
+                    local age = now - p.sentAt
+                    if age > 700 then
+                        if p.retries >= 3 then
+                            cmdPending[n] = nil
+                            setCmdStatus("fail", "no answer")
+                        else
+                            p.retries = p.retries + 1
+                            p.sentAt = now
+                            safeTransmit(p.payload)
+                        end
+                    end
                 end
-                refreshTimer = os.startTimer(1)
+                if cmdShownUntil > 0 and now > cmdShownUntil and cmdStatus ~= "sending" then
+                    cmdStatus, cmdMessage = nil, nil
+                end
+                if screen == "server" or screen == "home" then drawCurrent() end
+                refrT = os.startTimer(0.5)
             end
 
         elseif ev == "modem_message" then
             local message = event[5]
             if type(message) == "table" then
-                if message.type == "BASE_STATUS" then
-                    baseLocked   = message.locked
-                    baseTps      = message.tps      or baseTps
+                local mt = message.type
+                if mt == "BASE_STATUS" then
+                    baseLocked = message.locked
+                    baseOwner  = message.owner or ""
+                    baseTps    = message.tps or baseTps
                     baseGameTime = message.gameTime or baseGameTime
-                    baseGameDay  = message.gameDay  or baseGameDay
-                    lastBaseAt   = os.epoch("utc")
-                    drawCurrentPage()
-                elseif message.type == "GUEST_LIST" then
-                    guestList = message.guests or {}
-                    if currentPage == "guests" then drawCurrentPage() end
-                elseif message.type == "PING_REPLY" then
-                    local n = message.nonce
-                    local sentAt = pingPending[n]
-                    if sentAt then
-                        lastPingMs = os.epoch("utc") - sentAt
-                        pingPending[n] = nil
+                    baseGameDay  = message.gameDay or baseGameDay
+                    baseDoorsSummary = message.doors or {}
+                    drawCurrent()
+                elseif mt == "DOORS_FULL" then
+                    baseDoorsFull = message.doors or {}
+                    if screen == "doors" or screen == "door_detail" or screen == "door_users" or screen == "door_pwds" then
+                        drawCurrent()
                     end
-                    if message.tps      then baseTps      = message.tps      end
+                elseif mt == "PERIPHERAL_LIST" then
+                    periList = {
+                        relays   = message.relays   or {},
+                        modems   = message.modems   or {},
+                        monitors = message.monitors or {},
+                        statusMonitor = message.statusMonitor,
+                    }
+                    if screen == "hardware" then drawCurrent() end
+                elseif mt == "PING_REPLY" then
+                    local n = message.nonce
+                    local sent = pingPending[n]
+                    if sent then lastPingMs = os.epoch("utc") - sent; pingPending[n] = nil end
+                    if message.tps then baseTps = message.tps end
                     if message.gameTime then baseGameTime = message.gameTime end
-                    if message.gameDay  then baseGameDay  = message.gameDay  end
-                    if currentPage == "server" then drawCurrentPage() end
+                    if message.gameDay then baseGameDay = message.gameDay end
+                    if screen == "server" then drawCurrent() end
+                elseif mt == "OWNER_ACK" then
+                    local n = message.nonce
+                    local p = cmdPending[n]
+                    if p then
+                        cmdPending[n] = nil
+                        if message.success then
+                            setCmdStatus("ok", p.label)
+                            -- Refresh data on relevant successes
+                            requestDoors()
+                        else
+                            setCmdStatus("fail", message.reason or "rejected")
+                        end
+                        drawCurrent()
+                    end
                 end
             end
 
         elseif ev == "mouse_click" or ev == "monitor_touch" then
             local x, y = event[3], event[4]
-            if guestInputMode then
+            if inputCfg then
                 local w, h = term.getSize()
-                if x < 3 or x > w - 2 or y < 8 or y > 14 then
-                    guestInputMode = false
-                    guestInput = ""
-                    drawCurrentPage()
+                if x < 3 or x > w - 2 or y < 6 or y > 14 then
+                    endInput(false)
                 end
+                -- swallow click either way; input box has no clickable controls
+                -- (Enter/Esc/Backspace come via keyboard)
             else
                 local clicked = findClickedAction(x, y)
                 if clicked then handleAction(clicked) end
             end
 
-        elseif ev == "key" and guestInputMode then
-            local key = event[2]
-            if key == keys.enter then
-                if guestInput ~= "" then
-                    sendCommand("add_guest", guestInput)
-                    sleep(0.3)
-                    requestGuests()
-                end
-                guestInputMode = false
-                guestInput = ""
-                drawCurrentPage()
-            elseif key == keys.backspace then
-                if #guestInput > 0 then
-                    guestInput = guestInput:sub(1, -2)
-                    drawGuestInput()
-                end
-            elseif key == keys.escape then
-                guestInputMode = false
-                guestInput = ""
-                drawCurrentPage()
-            elseif key >= keys.a and key <= keys.z and #guestInput < 16 then
-                guestInput = guestInput .. string.char(key - keys.a + string.byte("a"))
-                drawGuestInput()
-            elseif key >= keys.zero and key <= keys.nine and #guestInput < 16 then
-                guestInput = guestInput .. string.char(key - keys.zero + string.byte("0"))
-                drawGuestInput()
-            elseif key == keys.space and #guestInput < 16 then
-                guestInput = guestInput .. " "
-                drawGuestInput()
-            elseif (key == keys.minus or key == keys.underscore) and #guestInput < 16 then
-                guestInput = guestInput .. "_"
-                drawGuestInput()
-            end
+        elseif ev == "key" then
+            local k = event[2]
+            if inputCfg then handleKey(k) end
+
+        elseif ev == "char" then
+            local ch = event[2]
+            if inputCfg then handleChar(ch) end
 
         elseif ev == "peripheral" then
-            -- new peripheral attached: if it's a modem, re-resolve
             if event[2] then
-                local ok, pType = pcall(peripheral.getType, event[2])
-                if ok and pType == "modem" then
-                    resolveModem()
-                end
+                local ok, t = pcall(peripheral.getType, event[2])
+                if ok and t == "modem" then resolveModem() end
             end
-
         elseif ev == "peripheral_detach" then
-            if event[2] == modemName then
-                modem = nil
-                modemName = nil
-                resolveModem()  -- maybe another modem is still attached
-            end
+            if event[2] == modemName then modem, modemName = nil, nil; resolveModem() end
         end
     end
 end
