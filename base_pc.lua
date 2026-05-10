@@ -9,6 +9,21 @@ local REPLY_CHANNEL  = 101
 local PING_TIMEOUT   = 2
 local PAD_IDLE_CLEAR = 8
 
+-- ============================================ HASH ============================================
+-- Same djb2+salt as owner.lua so hashes generated on either side compare.
+local function hashPin(pin, salt)
+    salt = salt or "base"
+    local h = 5381
+    local s = salt .. "|" .. pin .. "|" .. salt
+    for i = 1, #s do
+        h = ((h * 33) + string.byte(s, i)) % 0x100000000
+    end
+    for _ = 1, 1000 do
+        h = ((h * 33) + (h % 257)) % 0x100000000
+    end
+    return string.format("%08x", h)
+end
+
 local OWNER_NAME = settings.get("base_owner") or ""
 
 -- ============================================ STATE ============================================
@@ -17,6 +32,7 @@ local state = {
     locked         = false,
     doors          = {},   -- id -> door
     statusMonitor  = nil,  -- string or nil
+    basePin        = nil,  -- hash string or nil; protects W (wipe) on dashboard
 }
 
 local rt = {
@@ -81,6 +97,7 @@ local function saveState()
     local payload = {
         owner = OWNER_NAME, locked = state.locked,
         doors = state.doors, statusMonitor = state.statusMonitor,
+        basePin = state.basePin,
     }
     local ok, txt = pcall(textutils.serialize, payload)
     if not ok then return end
@@ -97,6 +114,7 @@ local function loadState()
     state.locked = d.locked == true
     state.doors = d.doors or {}
     state.statusMonitor = d.statusMonitor
+    state.basePin = d.basePin
     if d.owner and d.owner ~= "" then
         OWNER_NAME = d.owner
         settings.set("base_owner", OWNER_NAME); settings.save()
@@ -191,6 +209,10 @@ end
 
 -- ============================================ ACK + COMMANDS ============================================
 
+-- Idempotency cache for owner commands: nonce -> {success, reason, expiry}
+local nonceCache = {}
+local NONCE_TTL = 15  -- seconds; long enough for 3 retries x 0.7s each
+
 local function ackTo(modemName, nonce, ok, reason)
     if not modemName then return end
     local m = peripheral.wrap(modemName)
@@ -201,8 +223,29 @@ local function ackTo(modemName, nonce, ok, reason)
     end
 end
 
+local function tickNonceCache()
+    local now = os.clock()
+    for n, e in pairs(nonceCache) do
+        if e.expiry < now then nonceCache[n] = nil end
+    end
+end
+
 local function handleOwnerCommand(message, sourceModem)
-    local function ack(s, r) ackTo(sourceModem, message.nonce, s, r) end
+    local nonce = message.nonce
+
+    -- Idempotency: if we've seen this nonce recently, just re-send the cached ack
+    if nonce and nonceCache[nonce] then
+        local cached = nonceCache[nonce]
+        ackTo(sourceModem, nonce, cached.success, cached.reason)
+        return
+    end
+
+    local function ack(s, r)
+        ackTo(sourceModem, nonce, s, r)
+        if nonce then
+            nonceCache[nonce] = { success = s, reason = r, expiry = os.clock() + NONCE_TTL }
+        end
+    end
 
     -- Bootstrap: first claim wins when no owner is set
     if OWNER_NAME == "" then
@@ -345,6 +388,16 @@ local function handleOwnerCommand(message, sourceModem)
         end
         ack(false, "not found"); return
 
+    elseif cmd == "set_base_pin" then
+        -- data = { pinHash = "..." } or { pinHash = nil } to clear
+        if type(data.pinHash) == "string" and data.pinHash ~= "" then
+            state.basePin = data.pinHash
+            saveState()
+        elseif data.pinHash == nil or data.pinHash == "" then
+            state.basePin = nil
+            saveState()
+        end
+
     else
         ack(false, "unknown: " .. tostring(cmd)); return
     end
@@ -363,24 +416,64 @@ local PAD_KEYS = {
     {"C","0","OK"},
 }
 
--- Build button rectangles for a given monitor size; returns layout {keys=[{ch,x1,y1,x2,y2}], display={x,y,w}}
-local function padLayout(w, h)
-    local btnW = math.max(4, math.floor((w - 4) / 3))
-    local btnH = math.max(2, math.floor((h - 6) / 5))
-    local startX = math.floor((w - (btnW * 3 + 2)) / 2) + 1
-    local startY = h - (btnH * 4 + 3)
-    if startY < 5 then startY = 5 end
+-- Compute layout for a given (effective) monitor size.
+-- Returns nil if size too small to fit a usable keypad.
+local function computePadLayout(w, h)
+    -- Header (1) + display (1) + status (1) + spacing (3) + 4 button rows + 3 row gaps = need >= 8 for keypad zone
+    -- Buttons: at minimum 3w x 1h each, plus 2 horizontal gaps -> >= 11 wide
+    if w < 11 or h < 8 then return nil end
+
+    -- Keypad zone starts at row 4, ends at h-1
+    local zoneTop = 4
+    local zoneBottom = h - 1
+    local zoneH = zoneBottom - zoneTop + 1
+    -- 4 button rows + 3 gaps between them; each row at least 1 high
+    local btnH = math.max(1, math.floor((zoneH - 3) / 4))
+    if btnH < 1 then return nil end
+    local rowGap = (zoneH - 4 * btnH >= 3) and 1 or 0
+
+    local btnW = math.max(3, math.floor((w - 4) / 3))
+    local colGap = (w - 3 * btnW >= 4) and 1 or 0
+
+    local startX = math.floor((w - (btnW * 3 + 2 * colGap)) / 2) + 1
+    if startX < 2 then startX = 2 end
+
+    local totalH = btnH * 4 + rowGap * 3
+    local startY = zoneTop + math.max(0, math.floor((zoneH - totalH) / 2))
+
     local keys = {}
     for r = 1, 4 do
         for c = 1, 3 do
-            local x1 = startX + (c - 1) * (btnW + 1)
-            local y1 = startY + (r - 1) * (btnH + 1) - 1
+            local x1 = startX + (c - 1) * (btnW + colGap)
+            local y1 = startY + (r - 1) * (btnH + rowGap)
             local x2 = x1 + btnW - 1
             local y2 = y1 + btnH - 1
             table.insert(keys, { ch = PAD_KEYS[r][c], x1 = x1, y1 = y1, x2 = x2, y2 = y2 })
         end
     end
-    return { keys = keys, displayY = startY - 3 }
+
+    return {
+        keys = keys,
+        displayY = 3,
+        statusY = startY - 1,
+    }
+end
+
+-- Try to find the best text scale that gives a usable layout.
+-- Returns scale, layout, w, h. May return nil layout if monitor too small at any scale.
+local SCALES = { 1, 0.5, 1.5, 2, 2.5, 3 }
+local function findScaleAndLayout(mon)
+    -- Try preferred order: 1, 0.5 (smaller text = more room), then bigger.
+    for _, s in ipairs(SCALES) do
+        pcall(mon.setTextScale, s)
+        local w, h = mon.getSize()
+        local L = computePadLayout(w, h)
+        if L then return s, L, w, h end
+    end
+    -- Last attempt at smallest text
+    pcall(mon.setTextScale, 0.5)
+    local w, h = mon.getSize()
+    return 0.5, nil, w, h
 end
 
 local function fillRect(mon, x1, y1, x2, y2, bg)
@@ -399,6 +492,8 @@ local function padHash(door, input)
 end
 
 local prevPadHash = {}
+-- Cache the layout per monitor so touch handler can use the SAME layout used to render
+local padLayoutCache = {}  -- monName -> {layout, scale, w, h}
 
 local function drawPad(doorId, force)
     local d = state.doors[doorId]; if not d or not d.padMonitor then return end
@@ -409,10 +504,11 @@ local function drawPad(doorId, force)
     if not force and prevPadHash[doorId] == h then return end
     prevPadHash[doorId] = h
 
-    pcall(mon.setTextScale, 1)
+    local scale, L, w, mh = findScaleAndLayout(mon)
+    padLayoutCache[d.padMonitor] = { layout = L, scale = scale, w = w, h = mh }
+
     mon.setBackgroundColor(colors.black)
     mon.clear()
-    local w, mh = mon.getSize()
 
     -- Header
     mon.setBackgroundColor(colors.gray)
@@ -423,28 +519,38 @@ local function drawPad(doorId, force)
     mon.setCursorPos(math.floor((w - #title) / 2) + 1, 1); mon.write(title)
     mon.setBackgroundColor(colors.black)
 
-    local L = padLayout(w, mh)
+    if not L then
+        -- Monitor too small for keypad: show name + state warning
+        mon.setTextColor(colors.red)
+        local msg = "Too small"
+        if #msg > w then msg = msg:sub(1, w) end
+        mon.setCursorPos(math.max(1, math.floor((w - #msg) / 2) + 1), math.max(2, math.floor(mh / 2)))
+        mon.write(msg)
+        return
+    end
 
-    -- Display field
+    -- Display field (password buffer)
     local masked = string.rep("*", #input.buffer)
-    if masked == "" then masked = "(enter password)" end
+    if masked == "" then masked = "(enter pwd)" end
     local maxLen = w - 4
     if #masked > maxLen then masked = masked:sub(-maxLen) end
     mon.setCursorPos(2, L.displayY)
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.yellow)
-    mon.write(" " .. masked .. string.rep(" ", w - 3 - #masked) .. " ")
+    local pad = w - 3 - #masked
+    if pad < 0 then pad = 0 end
+    mon.write(" " .. masked .. string.rep(" ", pad) .. " ")
     mon.setBackgroundColor(colors.black)
 
-    -- Status line (right above keypad)
-    if input.status and input.status ~= "" then
+    -- Status line above keypad
+    if input.status and input.status ~= "" and L.statusY and L.statusY >= 2 then
         local color = colors.lightGray
         if input.status:sub(1, 2) == "OK" then color = colors.lime
         elseif input.status:sub(1, 4) == "WRONG" or input.status:sub(1, 4) == "FAIL" then color = colors.red end
         mon.setTextColor(color)
         local txt = input.status
         if #txt > w - 2 then txt = txt:sub(1, w - 2) end
-        mon.setCursorPos(math.floor((w - #txt) / 2) + 1, L.displayY + 1)
+        mon.setCursorPos(math.floor((w - #txt) / 2) + 1, L.statusY)
         mon.write(txt)
     end
 
@@ -469,12 +575,12 @@ local function drawAllPads(force)
     end
 end
 
--- Returns clicked key char or nil
+-- Use the cached layout the pad was rendered with (the touch coordinates come
+-- from the same scale the monitor is currently at).
 local function padHitTest(monName, mx, my)
-    local mon = peripheral.wrap(monName); if not mon then return nil end
-    local w, h = mon.getSize()
-    local L = padLayout(w, h)
-    for _, k in ipairs(L.keys) do
+    local cached = padLayoutCache[monName]
+    if not cached or not cached.layout then return nil end
+    for _, k in ipairs(cached.layout.keys) do
         if mx >= k.x1 and mx <= k.x2 and my >= k.y1 and my <= k.y2 then
             return k.ch
         end
@@ -669,48 +775,207 @@ end
 
 -- ============================================ KEYBOARD CONSOLE ============================================
 
-local function consoleHelp()
-    print("Commands:")
-    print("  doors      list doors")
-    print("  peri       list peripherals")
-    print("  owner      show owner")
-    print("  reset-all  delete state, restart")
-    print("  reboot     reboot")
+-- ============================================ BASE TERMINAL DASHBOARD ============================================
+-- Renders to the base PC's own screen (term.*). Shows live state of all doors,
+-- lock state, owner, peripherals. Bottom bar has key shortcuts.
+
+local prevTermHash = nil
+
+local function drawTermDashboard(force)
+    -- Build a snapshot hash so we don't redraw if nothing changed
+    local parts = { OWNER_NAME, tostring(state.locked), tostring(state.statusMonitor or "-"),
+                    state.basePin and "pin:set" or "pin:none" }
+    for _, id in ipairs(sortedDoorIds()) do
+        local d = state.doors[id]
+        table.insert(parts, id .. ":" .. d.name .. ":" ..
+            tostring(rt.doorOpen[id] == true) .. ":" ..
+            tostring(d.enabled) .. ":" ..
+            (d.padMonitor or "-") .. ":" ..
+            d.modem .. ":" .. d.relay)
+    end
+    local hash = table.concat(parts, "|")
+    if not force and hash == prevTermHash then return end
+    prevTermHash = hash
+
+    term.setBackgroundColor(colors.black)
+    term.clear()
+    local w, h = term.getSize()
+
+    -- Header bar
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    for x = 1, w do term.setCursorPos(x, 1); term.write(" ") end
+    term.setCursorPos(2, 1); term.write("BASE v12")
+    local right = state.locked and "LOCKED" or "OPEN"
+    term.setTextColor(state.locked and colors.red or colors.lime)
+    term.setCursorPos(w - #right, 1); term.write(right)
+    term.setBackgroundColor(colors.black)
+
+    -- Owner line
+    term.setTextColor(colors.lightGray)
+    term.setCursorPos(2, 3); term.write("Owner: ")
+    term.setTextColor(colors.white)
+    term.write(OWNER_NAME ~= "" and OWNER_NAME or "(unclaimed - use tablet)")
+
+    term.setTextColor(colors.lightGray)
+    term.setCursorPos(2, 4); term.write("Doors: ")
+    term.setTextColor(colors.white); term.write(tostring(countTbl(state.doors)))
+
+    term.setTextColor(colors.lightGray)
+    term.setCursorPos(2, 5); term.write("Status mon: ")
+    term.setTextColor(state.statusMonitor and colors.white or colors.gray)
+    term.write(state.statusMonitor or "(none)")
+
+    term.setTextColor(colors.lightGray)
+    term.setCursorPos(2, 6); term.write("Wipe PIN: ")
+    if state.basePin and state.basePin ~= "" then
+        term.setTextColor(colors.lime); term.write("set")
+    else
+        term.setTextColor(colors.gray); term.write("(none - W will only ask YES)")
+    end
+
+    -- Door table
+    term.setTextColor(colors.gray)
+    term.setCursorPos(2, 8); term.write(string.rep("-", w - 2))
+    term.setTextColor(colors.white)
+    term.setCursorPos(2, 9); term.write("NAME")
+    term.setCursorPos(15, 9); term.write("STATE")
+    term.setCursorPos(23, 9); term.write("MODEM")
+    term.setCursorPos(35, 9); term.write("PAD")
+    term.setCursorPos(2, 10); term.setTextColor(colors.gray); term.write(string.rep("-", w - 2))
+
+    local y = 11
+    local ids = sortedDoorIds()
+    if #ids == 0 then
+        term.setTextColor(colors.gray)
+        term.setCursorPos(2, y); term.write("(no doors yet - add via tablet)")
+    else
+        for _, id in ipairs(ids) do
+            if y >= h - 2 then
+                term.setTextColor(colors.gray)
+                term.setCursorPos(2, y); term.write("...and " .. (#ids - (y - 11)) .. " more")
+                break
+            end
+            local d = state.doors[id]
+            local nm = d.name
+            if #nm > 12 then nm = nm:sub(1, 11) .. "." end
+            term.setTextColor(colors.white)
+            term.setCursorPos(2, y); term.write(nm)
+
+            local stateTxt, stateCol
+            if not d.enabled then stateTxt, stateCol = "DISABLED", colors.gray
+            elseif rt.doorOpen[id] then stateTxt, stateCol = "OPEN ", colors.lime
+            else stateTxt, stateCol = "CLOSE", colors.red end
+            term.setTextColor(stateCol)
+            term.setCursorPos(15, y); term.write(stateTxt)
+
+            local mn = d.modem
+            if mn == "" then mn = "-" end
+            if #mn > 11 then mn = mn:sub(1, 10) .. "." end
+            term.setTextColor(d.modem == "" and colors.red or colors.lightGray)
+            term.setCursorPos(23, y); term.write(mn)
+
+            local pm = d.padMonitor or "-"
+            if #pm > 12 then pm = pm:sub(1, 11) .. "." end
+            term.setTextColor(d.padMonitor and colors.lightBlue or colors.gray)
+            term.setCursorPos(35, y); term.write(pm)
+            y = y + 1
+        end
+    end
+
+    -- Footer with shortcuts
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    for x = 1, w do term.setCursorPos(x, h); term.write(" ") end
+    term.setCursorPos(2, h)
+    term.write("[P]eri [R]eboot [W]ipe state")
+    term.setBackgroundColor(colors.black)
+    term.setCursorPos(1, h - 1)
 end
 
-local function consoleLoop()
-    print("=== BASE SERVER v12 ===")
-    if OWNER_NAME == "" then
-        print("[!] No owner. Run owner.lua on a tablet to claim this base.")
-    else
-        print("Owner: " .. OWNER_NAME)
+local function showPeriList()
+    term.setBackgroundColor(colors.black); term.clear()
+    term.setCursorPos(1, 1)
+    term.setTextColor(colors.yellow); print("=== Peripherals on this base ===")
+    term.setTextColor(colors.white); print("Relays:")
+    for _, n in ipairs(listByType("redstone_relay")) do
+        term.setTextColor(colors.lightGray); print("  " .. n)
     end
-    print("Doors: " .. countTbl(state.doors) .. ". Type 'help' for commands.")
-    while true do
+    term.setTextColor(colors.white); print("Modems:")
+    for _, n in ipairs(listByType("modem")) do
+        term.setTextColor(colors.lightGray); print("  " .. n)
+    end
+    term.setTextColor(colors.white); print("Monitors:")
+    for _, n in ipairs(listByType("monitor")) do
+        term.setTextColor(colors.lightGray); print("  " .. n)
+    end
+    term.setTextColor(colors.gray)
+    print("")
+    print("Press any key to return...")
+    os.pullEvent("key")
+    prevTermHash = nil  -- force redraw of dashboard
+    drawTermDashboard(true)
+end
+
+local function confirmWipe()
+    term.setBackgroundColor(colors.black); term.clear()
+    term.setCursorPos(1, 1)
+    term.setTextColor(colors.red)
+    print("=== WIPE BASE STATE ===")
+    term.setTextColor(colors.white)
+    print("This deletes all doors, owner, settings.")
+    print("")
+
+    -- PIN check first if set
+    if state.basePin and state.basePin ~= "" then
+        term.setTextColor(colors.yellow)
+        print("Enter base PIN:")
+        term.setTextColor(colors.white)
         write("> ")
-        local line = read()
-        if line == "help" then consoleHelp()
-        elseif line == "doors" then
-            for _, id in ipairs(sortedDoorIds()) do
-                local d = state.doors[id]
-                print(("%s | %s | relay=%s/%s modem=%s r=%d open=%s pad=%s"):format(
-                    id, d.name, d.relay, d.relaySide, d.modem, d.radius,
-                    tostring(rt.doorOpen[id] == true), tostring(d.padMonitor or "-")))
+        local pin = read("*")
+        if hashPin(pin, "base") ~= state.basePin then
+            term.setTextColor(colors.red); print("Wrong PIN.")
+            sleep(2)
+            prevTermHash = nil
+            drawTermDashboard(true)
+            return
+        end
+    end
+
+    print("Type YES (uppercase) to confirm:")
+    write("> ")
+    local line = read()
+    if line == "YES" then
+        fs.delete("base_state.dat")
+        settings.unset("base_owner"); settings.save()
+        term.setTextColor(colors.yellow)
+        print("Wiped. Rebooting in 2s...")
+        sleep(2)
+        os.reboot()
+    else
+        prevTermHash = nil
+        drawTermDashboard(true)
+    end
+end
+
+local function dashboardLoop()
+    drawTermDashboard(true)
+    local refreshTimer = os.startTimer(0.5)
+    while true do
+        local ev = { os.pullEvent() }
+        if ev[1] == "key" then
+            local k = ev[2]
+            if k == keys.p then showPeriList()
+            elseif k == keys.r then os.reboot()
+            elseif k == keys.w then confirmWipe()
             end
-        elseif line == "peri" then
-            print("Relays:");   for _, n in ipairs(listByType("redstone_relay")) do print("  " .. n) end
-            print("Modems:");   for _, n in ipairs(listByType("modem")) do print("  " .. n) end
-            print("Monitors:"); for _, n in ipairs(listByType("monitor")) do print("  " .. n) end
-        elseif line == "owner" then print("Owner: " .. (OWNER_NAME ~= "" and OWNER_NAME or "(unset)"))
-        elseif line == "reset-all" then
-            print("Type 'YES' to wipe state:"); local c = read()
-            if c == "YES" then
-                fs.delete("base_state.dat")
-                settings.unset("base_owner"); settings.save()
-                print("Wiped. Rebooting..."); sleep(1); os.reboot()
-            end
-        elseif line == "reboot" then os.reboot()
-        elseif line and line ~= "" then print("Unknown. Type 'help'.") end
+        elseif ev[1] == "term_resize" then
+            prevTermHash = nil
+            drawTermDashboard(true)
+        elseif ev[1] == "timer" and ev[2] == refreshTimer then
+            drawTermDashboard(false)
+            refreshTimer = os.startTimer(0.5)
+        end
     end
 end
 
@@ -742,6 +1007,7 @@ local function networkLoop()
                 tpsLastReal = nowReal
                 tickAutoClose()
                 tickPads()
+                tickNonceCache()
                 if rt.drawNeeded then
                     drawStatus(); drawAllPads(false)
                     rt.drawNeeded = false
@@ -813,4 +1079,4 @@ end
 loadState()
 openAllModems()
 
-parallel.waitForAny(networkLoop, consoleLoop)
+parallel.waitForAny(networkLoop, dashboardLoop)
