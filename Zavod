@@ -191,7 +191,7 @@ local function drawMain(force)
     local _, w, h = autoScale(mon, 16, 8)
     mon.setBackgroundColor(colors.black); mon.clear()
 
-    drawHeader(mon, w, "FARM CONTROL", colors.cyan)
+    drawHeader(mon, w, "Stres Control", colors.cyan)
 
     -- Stress display row (uses 2 rows when stressometer present)
     local listTop = 3
@@ -369,7 +369,7 @@ local function drawAddName()
     -- Need ~40 cols for 10 columns of 3-wide buttons + gaps
     local _, w, h = autoScale(mon, 40, 12)
     mon.setBackgroundColor(colors.black); mon.clear()
-    drawHeader(mon, w, "FARM NAME", colors.green)
+    drawHeader(mon, w, "NAME", colors.green)
 
     -- Display field
     mon.setBackgroundColor(colors.gray); mon.setTextColor(colors.yellow)
