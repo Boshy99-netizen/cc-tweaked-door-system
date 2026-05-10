@@ -7,6 +7,25 @@ local KEY_CHANNEL    = 100
 local REPLY_CHANNEL  = 101
 local PING_INTERVAL  = 1
 local RTT_INTERVAL   = 2
+local LOCK_TIMEOUT   = 120  -- seconds of inactivity before auto-lock
+
+-- ============================================ PIN HASH ============================================
+-- Simple obfuscation hash (djb2 + salt + slow rounds). Not crypto-grade,
+-- just so PIN doesn't sit as plaintext in .settings.
+
+local function hashPin(pin, salt)
+    salt = salt or tostring(os.getComputerID())
+    local h = 5381
+    local s = salt .. "|" .. pin .. "|" .. salt
+    for i = 1, #s do
+        h = ((h * 33) + string.byte(s, i)) % 0x100000000
+    end
+    -- Slow down brute force a tiny bit
+    for _ = 1, 1000 do
+        h = ((h * 33) + (h % 257)) % 0x100000000
+    end
+    return string.format("%08x", h)
+end
 
 -- ============================================ INIT ============================================
 
@@ -55,6 +74,16 @@ local screen = "home"  -- home, doors, door_detail, door_users, door_user_edit, 
 local stack  = {}      -- screen stack for back navigation; entries: {screen, ctx}
 local ctx    = {}      -- per-screen context (e.g. selected doorId, edit field)
 local buttons = {}     -- action -> {x1,y1,x2,y2}
+
+-- Lock screen state
+local lockState     = "checking"  -- "first_setup", "confirm_setup", "locked", "unlocked"
+local pinBuffer     = ""
+local pinFirstEntry = ""
+local pinError      = ""
+local lastActivity  = os.clock()
+
+local function isLocked()  return lockState ~= "unlocked" end
+local function markActive() lastActivity = os.clock() end
 
 -- Base info
 local baseLocked, baseOwner = nil, nil
@@ -491,6 +520,9 @@ local function drawHardware()
 
     drawBtn(2, 15, " [REFRESH] ", colors.gray, colors.white, "refresh_peri")
     drawBtn(2, 16, " [SET OWNER] ", colors.blue, colors.white, "set_owner")
+    drawBtn(2, 17, " [CHANGE PIN] ", colors.purple, colors.white, "change_pin")
+    drawBtn(15, 17, " [LOCK NOW] ", colors.red, colors.white, "lock_now")
+    drawBtn(2, 18, " [SET BASE PIN] ", colors.cyan, colors.black, "set_base_pin")
 
     drawCmdStatus(h - 3)
     drawNavBar()
@@ -662,9 +694,158 @@ local function endPicker(value)
     drawCurrent()
 end
 
+-- ============================================ PIN SCREEN ============================================
+
+local PIN_KEYS = {
+    {"1","2","3"},
+    {"4","5","6"},
+    {"7","8","9"},
+    {"<","0","OK"},  -- < = backspace, OK = submit
+}
+
+local function drawPinScreen()
+    clearScreen(); drawFrame()
+    buttons = {}
+
+    local headerColor, headerText
+    if lockState == "first_setup" then
+        headerColor, headerText = colors.green, " SET PIN "
+    elseif lockState == "confirm_setup" then
+        headerColor, headerText = colors.green, " CONFIRM PIN "
+    else
+        headerColor, headerText = colors.red, " LOCKED "
+    end
+    drawHeader(headerText, headerColor)
+
+    local w, h = term.getSize()
+
+    -- Title text
+    if lockState == "first_setup" then
+        centerWrite(4, "Set 4-digit PIN", colors.white)
+        centerWrite(5, "for your tablet", colors.lightGray)
+    elseif lockState == "confirm_setup" then
+        centerWrite(4, "Re-enter PIN", colors.white)
+        centerWrite(5, "to confirm", colors.lightGray)
+    else
+        centerWrite(4, playerName, colors.white)
+        centerWrite(5, "Enter PIN", colors.lightGray)
+    end
+
+    -- PIN dots (4 positions)
+    local dotsY = 7
+    local startX = math.floor(w / 2) - 3
+    for i = 1, 4 do
+        term.setCursorPos(startX + (i - 1) * 2, dotsY)
+        if i <= #pinBuffer then
+            term.setTextColor(colors.yellow); term.write("*")
+        else
+            term.setTextColor(colors.gray); term.write("_")
+        end
+    end
+
+    -- Error message
+    if pinError ~= "" then
+        centerWrite(8, pinError, colors.red)
+    end
+
+    -- Numpad keys
+    local btnW, btnH = 6, 2
+    local gridW = btnW * 3 + 2
+    local kpStartX = math.floor((w - gridW) / 2) + 1
+    local kpStartY = h - (btnH * 4 + 3) - 1
+    if kpStartY < 10 then kpStartY = 10 end
+
+    for r = 1, 4 do
+        for c = 1, 3 do
+            local ch = PIN_KEYS[r][c]
+            local x  = kpStartX + (c - 1) * (btnW + 1)
+            local y  = kpStartY + (r - 1) * (btnH + 1)
+            local bg, fg = colors.lightGray, colors.black
+            if ch == "OK" then bg, fg = colors.green, colors.white
+            elseif ch == "<" then bg, fg = colors.red, colors.white end
+            -- Fill rect
+            for yy = y, y + btnH - 1 do
+                term.setCursorPos(x, yy)
+                term.setBackgroundColor(bg)
+                term.write(string.rep(" ", btnW))
+            end
+            -- Centered text
+            local cx = x + math.floor((btnW - #ch) / 2)
+            local cy = y + math.floor(btnH / 2)
+            term.setCursorPos(cx, cy)
+            term.setTextColor(fg); term.setBackgroundColor(bg)
+            term.write(ch)
+
+            buttons["pin_" .. ch] = { x1 = x, y1 = y, x2 = x + btnW - 1, y2 = y + btnH - 1 }
+        end
+    end
+    term.setBackgroundColor(colors.black)
+end
+
+-- handle one PIN keypress: digit char ("0".."9"), "<", or "OK"
+local function handlePinInput(key)
+    markActive()
+    pinError = ""
+
+    if key == "<" then
+        if #pinBuffer > 0 then pinBuffer = pinBuffer:sub(1, -2) end
+        drawPinScreen(); return
+    end
+
+    if key == "OK" then
+        if #pinBuffer ~= 4 then
+            pinError = "PIN must be 4 digits"
+            drawPinScreen(); return
+        end
+
+        if lockState == "first_setup" then
+            pinFirstEntry = pinBuffer
+            pinBuffer = ""
+            lockState = "confirm_setup"
+            drawPinScreen()
+        elseif lockState == "confirm_setup" then
+            if pinBuffer == pinFirstEntry then
+                local hash = hashPin(pinBuffer)
+                settings.set("pin_hash", hash); settings.save()
+                pinBuffer = ""; pinFirstEntry = ""
+                lockState = "unlocked"
+                markActive()
+                drawCurrent()
+            else
+                pinError = "PINs do not match"
+                pinBuffer = ""; pinFirstEntry = ""
+                lockState = "first_setup"
+                drawPinScreen()
+            end
+        elseif lockState == "locked" then
+            local saved = settings.get("pin_hash") or ""
+            if saved == hashPin(pinBuffer) then
+                pinBuffer = ""
+                lockState = "unlocked"
+                markActive()
+                drawCurrent()
+            else
+                pinError = "Wrong PIN"
+                pinBuffer = ""
+                drawPinScreen()
+                sleep(0.5)  -- mild brute-force slowdown
+            end
+        end
+        return
+    end
+
+    -- digit
+    if #pinBuffer < 4 then
+        pinBuffer = pinBuffer .. key
+        drawPinScreen()
+    end
+end
+
 -- ============================================ DRAW DISPATCHER ============================================
 
 drawCurrent = function()
+    if isLocked() then drawPinScreen(); return end
+
     if screen == "home" then drawHome()
     elseif screen == "doors" then drawDoors()
     elseif screen == "door_detail" then drawDoorDetail()
@@ -912,6 +1093,42 @@ local function handleAction(action)
                 onSubmit = function(v) if v ~= "" then sendCommand("set_owner", { name = v }, "set owner") end end })
             return
         end
+        if action == "change_pin" then
+            -- Reset pin and re-enter setup mode
+            settings.unset("pin_hash"); settings.save()
+            lockState = "first_setup"
+            pinBuffer = ""
+            pinFirstEntry = ""
+            pinError = ""
+            drawPinScreen()
+            return
+        end
+        if action == "lock_now" then
+            lockState = "locked"
+            pinBuffer = ""
+            pinError = ""
+            drawPinScreen()
+            return
+        end
+        if action == "set_base_pin" then
+            startInput({
+                title = "Set base wipe PIN",
+                prompt = "4 digits (empty = clear):",
+                max = 4,
+                onSubmit = function(v)
+                    if v == "" then
+                        sendCommand("set_base_pin", { pinHash = "" }, "clear base pin")
+                    elseif #v == 4 and v:match("^%d%d%d%d$") then
+                        local hash = hashPin(v, "base")
+                        sendCommand("set_base_pin", { pinHash = hash }, "set base pin")
+                    else
+                        setCmdStatus("fail", "need 4 digits")
+                        drawCurrent()
+                    end
+                end,
+            })
+            return
+        end
     end
 end
 
@@ -953,8 +1170,17 @@ local function mainLoop()
     clearScreen()
     print("=== OWNER TABLET v12 ===")
     print("Player: " .. playerName)
-    print("Connecting...")
-    sleep(0.4)
+    sleep(0.3)
+
+    -- Decide initial lock state
+    local savedHash = settings.get("pin_hash")
+    if savedHash and savedHash ~= "" then
+        lockState = "locked"
+    else
+        lockState = "first_setup"
+        pinBuffer = ""
+        pinFirstEntry = ""
+    end
 
     drawCurrent()
     sendKeyPing(); sendPingRequest()
@@ -973,6 +1199,13 @@ local function mainLoop()
             if id == pingT then sendKeyPing(); pingT = os.startTimer(PING_INTERVAL)
             elseif id == rttT then sendPingRequest(); rttT = os.startTimer(RTT_INTERVAL)
             elseif id == refrT then
+                -- Auto-lock after inactivity
+                if lockState == "unlocked" and (os.clock() - lastActivity) > LOCK_TIMEOUT then
+                    lockState = "locked"
+                    pinBuffer = ""
+                    pinError = ""
+                    drawPinScreen()
+                end
                 -- Retry pending commands without ACK after 0.7s, max 3 retries
                 local now = os.epoch("utc")
                 for n, p in pairs(cmdPending) do
@@ -991,7 +1224,9 @@ local function mainLoop()
                 if cmdShownUntil > 0 and now > cmdShownUntil and cmdStatus ~= "sending" then
                     cmdStatus, cmdMessage = nil, nil
                 end
-                if screen == "server" or screen == "home" then drawCurrent() end
+                if not isLocked() and (screen == "server" or screen == "home") then
+                    drawCurrent()
+                end
                 refrT = os.startTimer(0.5)
             end
 
@@ -1006,10 +1241,10 @@ local function mainLoop()
                     baseGameTime = message.gameTime or baseGameTime
                     baseGameDay  = message.gameDay or baseGameDay
                     baseDoorsSummary = message.doors or {}
-                    drawCurrent()
+                    if not isLocked() then drawCurrent() end
                 elseif mt == "DOORS_FULL" then
                     baseDoorsFull = message.doors or {}
-                    if screen == "doors" or screen == "door_detail" or screen == "door_users" or screen == "door_pwds" then
+                    if not isLocked() and (screen == "doors" or screen == "door_detail" or screen == "door_users" or screen == "door_pwds") then
                         drawCurrent()
                     end
                 elseif mt == "PERIPHERAL_LIST" then
@@ -1019,7 +1254,7 @@ local function mainLoop()
                         monitors = message.monitors or {},
                         statusMonitor = message.statusMonitor,
                     }
-                    if screen == "hardware" then drawCurrent() end
+                    if not isLocked() and screen == "hardware" then drawCurrent() end
                 elseif mt == "PING_REPLY" then
                     local n = message.nonce
                     local sent = pingPending[n]
@@ -1027,7 +1262,7 @@ local function mainLoop()
                     if message.tps then baseTps = message.tps end
                     if message.gameTime then baseGameTime = message.gameTime end
                     if message.gameDay then baseGameDay = message.gameDay end
-                    if screen == "server" then drawCurrent() end
+                    if not isLocked() and screen == "server" then drawCurrent() end
                 elseif mt == "OWNER_ACK" then
                     local n = message.nonce
                     local p = cmdPending[n]
@@ -1035,37 +1270,59 @@ local function mainLoop()
                         cmdPending[n] = nil
                         if message.success then
                             setCmdStatus("ok", p.label)
-                            -- Refresh data on relevant successes
                             requestDoors()
                         else
                             setCmdStatus("fail", message.reason or "rejected")
                         end
-                        drawCurrent()
+                        if not isLocked() then drawCurrent() end
                     end
                 end
             end
 
         elseif ev == "mouse_click" or ev == "monitor_touch" then
             local x, y = event[3], event[4]
-            if inputCfg then
+            if isLocked() then
+                local clicked = findClickedAction(x, y)
+                if clicked and clicked:sub(1, 4) == "pin_" then
+                    handlePinInput(clicked:sub(5))
+                end
+            elseif inputCfg then
                 local w, h = term.getSize()
                 if x < 3 or x > w - 2 or y < 6 or y > 14 then
                     endInput(false)
                 end
                 -- swallow click either way; input box has no clickable controls
-                -- (Enter/Esc/Backspace come via keyboard)
             else
+                markActive()
                 local clicked = findClickedAction(x, y)
                 if clicked then handleAction(clicked) end
             end
 
         elseif ev == "key" then
             local k = event[2]
-            if inputCfg then handleKey(k) end
+            if isLocked() then
+                if k >= keys.zero and k <= keys.nine then
+                    handlePinInput(string.char(k - keys.zero + string.byte("0")))
+                elseif k >= keys.numPad0 and k <= keys.numPad9 then
+                    handlePinInput(string.char(k - keys.numPad0 + string.byte("0")))
+                elseif k == keys.backspace then
+                    handlePinInput("<")
+                elseif k == keys.enter or k == keys.numPadEnter then
+                    handlePinInput("OK")
+                end
+            elseif inputCfg then
+                markActive()
+                handleKey(k)
+            else
+                markActive()
+            end
 
         elseif ev == "char" then
             local ch = event[2]
-            if inputCfg then handleChar(ch) end
+            if not isLocked() and inputCfg then
+                markActive()
+                handleChar(ch)
+            end
 
         elseif ev == "peripheral" then
             if event[2] then
