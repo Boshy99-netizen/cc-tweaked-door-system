@@ -1,5 +1,5 @@
 -- ============================================
--- CONTROLLER v1.0
+-- FARM CONTROLLER v1.0
 -- Standalone program for toggling farms via inverted redstone relays.
 -- Relay HIGH = farm OFF (powered = stops the contraption)
 -- Relay LOW  = farm ON  (no signal = farm runs)
@@ -8,21 +8,23 @@
 -- ============================================ STATE ============================================
 
 local config = {
-    monitor = nil,    -- monitor name (touch surface)
-    farms   = {},     -- list of {id, name, relay, relaySide, enabled}
+    controlMonitor = nil,    -- main UI: farm list + settings
+    stressMonitor  = nil,    -- big stress display
+    animMonitor    = nil,    -- decorative animation
+    farms          = {},     -- {id, name, relay, relaySide, enabled}
 }
 
-local screen = "main"  -- main, settings, add_name, add_relay, add_side
-local addBuf = ""      -- text buffer for "Add farm: name" input
-local addDraft = nil   -- draft farm during add wizard
-local prevHash = nil   -- anti-flicker hash
-local layoutCache = nil -- cached button rectangles for current draw
+local screen = "main"  -- main, settings, add_name, add_relay, add_side, pick_monitor
+local addBuf = ""
+local addDraft = nil
+local prevHash = nil
+local layoutCache = nil
+local pickerTarget = nil  -- "control" | "stress" | "anim" while in pick_monitor screen
 
 -- Stressometer (Create mod)
-local stressData = nil  -- {current, capacity, name} or nil if no stressometer
+local stressData = nil  -- {current, capacity, name} or nil
 
 local function readStress()
-    -- Find first stressometer-type peripheral
     local stressTypes = { "Create_Stressometer", "create:stressometer", "stressometer" }
     for _, n in ipairs(peripheral.getNames()) do
         local t = peripheral.getType(n)
@@ -32,7 +34,6 @@ local function readStress()
                 if p then
                     local okC, cur = pcall(p.getStress)
                     local okM, max = pcall(p.getStressCapacity)
-                    -- Both must be numbers, capacity must be positive
                     if okC and okM
                        and type(cur) == "number" and type(max) == "number"
                        and max > 0 then
@@ -92,8 +93,11 @@ local function loadConfig()
     local txt = f.readAll(); f.close()
     local ok, decoded = pcall(textutils.unserialize, txt)
     if not ok or type(decoded) ~= "table" then return false end
-    config.monitor = decoded.monitor
-    config.farms   = decoded.farms or {}
+    -- Migrate old single-monitor field if present
+    config.controlMonitor = decoded.controlMonitor or decoded.monitor
+    config.stressMonitor  = decoded.stressMonitor
+    config.animMonitor    = decoded.animMonitor
+    config.farms          = decoded.farms or {}
     return true
 end
 
@@ -125,12 +129,21 @@ end
 
 -- ============================================ MONITOR HELPERS ============================================
 
-local function getMon()
-    if not config.monitor then return nil end
-    local m = peripheral.wrap(config.monitor)
-    if not m then return nil end
-    return m
+local function getControlMon()
+    if not config.controlMonitor then return nil end
+    return peripheral.wrap(config.controlMonitor)
 end
+local function getStressMon()
+    if not config.stressMonitor then return nil end
+    return peripheral.wrap(config.stressMonitor)
+end
+local function getAnimMon()
+    if not config.animMonitor then return nil end
+    return peripheral.wrap(config.animMonitor)
+end
+
+-- Backwards-compat alias used by drawing code below
+local function getMon() return getControlMon() end
 
 local function fillRect(mon, x1, y1, x2, y2, bg)
     mon.setBackgroundColor(bg)
@@ -191,55 +204,9 @@ local function drawMain(force)
     local _, w, h = autoScale(mon, 16, 8)
     mon.setBackgroundColor(colors.black); mon.clear()
 
-    drawHeader(mon, w, "Stres Control", colors.cyan)
+    drawHeader(mon, w, "STRESS CONTROL", colors.cyan)
 
-    -- Stress display row (uses 2 rows when stressometer present)
     local listTop = 3
-    if stressData and stressData.capacity > 0 then
-        local cur = stressData.current
-        local cap = stressData.capacity
-        local pct = cur / cap * 100
-        if pct > 100 then pct = 100 end
-        if pct < 0 then pct = 0 end
-
-        -- Color by load: <70 lime, <90 yellow, <100 orange, >=100 red
-        local color = colors.lime
-        if pct >= 100 then color = colors.red
-        elseif pct >= 90 then color = colors.orange
-        elseif pct >= 70 then color = colors.yellow
-        end
-
-        -- Line 1: "Stress: 1234/2048 SU"
-        mon.setBackgroundColor(colors.black); mon.setTextColor(colors.lightGray)
-        mon.setCursorPos(2, 3); mon.write("Stress:")
-        local txt = string.format("%d/%d SU", math.floor(cur), math.floor(cap))
-        mon.setTextColor(color)
-        if #txt > w - 11 then txt = txt:sub(1, w - 11) end
-        mon.setCursorPos(w - #txt, 3); mon.write(txt)
-
-        -- Line 2: progress bar with percentage
-        local barX1, barX2 = 2, w - 7
-        local barW = barX2 - barX1 + 1
-        local filled = math.floor(barW * pct / 100 + 0.5)
-        if filled < 0 then filled = 0 end
-        if filled > barW then filled = barW end
-        mon.setCursorPos(barX1, 4)
-        mon.setBackgroundColor(color)
-        mon.write(string.rep(" ", filled))
-        mon.setBackgroundColor(colors.gray)
-        mon.write(string.rep(" ", barW - filled))
-        mon.setBackgroundColor(colors.black)
-        local pctStr = string.format("%d%%", math.floor(pct + 0.5))
-        mon.setTextColor(color)
-        mon.setCursorPos(w - #pctStr, 4); mon.write(pctStr)
-
-        -- Separator
-        mon.setTextColor(colors.gray)
-        mon.setCursorPos(2, 5); mon.write(string.rep("-", w - 2))
-        listTop = 6
-    end
-
-    -- Footer reserved: 1 row at bottom for [SETTINGS]
     local listBottom = h - 2
 
     if #config.farms == 0 then
@@ -260,7 +227,6 @@ local function drawMain(force)
             local rowBot = rowTop + rowH - 1
             if rowBot > listBottom then break end
 
-            -- Name (left, vertically centered)
             local nameY = rowTop + math.floor((rowH - 1) / 2)
             local nm = f.name
             local maxNameLen = w - btnW - 4
@@ -268,7 +234,6 @@ local function drawMain(force)
             mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white)
             mon.setCursorPos(2, nameY); mon.write(nm)
 
-            -- Status pill on right
             local btnX2 = w - 1
             local btnX1 = btnX2 - btnW + 1
             local label = f.enabled and "ON" or "OFF"
@@ -278,8 +243,175 @@ local function drawMain(force)
         end
     end
 
-    -- Footer settings button
     drawBtn(mon, 2, h - 1, w - 1, h, "[ SETTINGS ]", colors.gray, colors.white, "go_settings")
+end
+
+-- ============================================ STRESS MONITOR ============================================
+
+local function drawStressMonitor()
+    local mon = getStressMon(); if not mon then return end
+    local _, w, h = autoScale(mon, 16, 8)
+    mon.setBackgroundColor(colors.black); mon.clear()
+
+    -- Title bar
+    mon.setBackgroundColor(colors.purple); mon.setTextColor(colors.white)
+    for x = 1, w do mon.setCursorPos(x, 1); mon.write(" ") end
+    local title = "STRESS"
+    mon.setCursorPos(math.floor((w - #title) / 2) + 1, 1); mon.write(title)
+    mon.setBackgroundColor(colors.black)
+
+    if not stressData or stressData.capacity <= 0 then
+        mon.setTextColor(colors.gray)
+        local msg1 = "No stressometer"
+        local msg2 = "or network idle"
+        mon.setCursorPos(math.floor((w - #msg1) / 2) + 1, math.floor(h / 2))
+        mon.write(msg1)
+        mon.setCursorPos(math.floor((w - #msg2) / 2) + 1, math.floor(h / 2) + 1)
+        mon.write(msg2)
+        return
+    end
+
+    local cur = stressData.current
+    local cap = stressData.capacity
+    local pct = cur / cap * 100
+    if pct > 100 then pct = 100 end
+    if pct < 0 then pct = 0 end
+
+    local color = colors.lime
+    if pct >= 100 then color = colors.red
+    elseif pct >= 90 then color = colors.orange
+    elseif pct >= 70 then color = colors.yellow
+    end
+
+    -- Big percentage in the center
+    local pctStr = string.format("%d%%", math.floor(pct + 0.5))
+    mon.setTextColor(color)
+    local pctY = math.max(3, math.floor(h / 2) - 1)
+    mon.setCursorPos(math.floor((w - #pctStr) / 2) + 1, pctY)
+    mon.write(pctStr)
+
+    -- Numeric values below
+    local numStr = string.format("%d / %d SU", math.floor(cur), math.floor(cap))
+    if #numStr > w - 2 then
+        numStr = string.format("%d/%d", math.floor(cur), math.floor(cap))
+    end
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(math.floor((w - #numStr) / 2) + 1, pctY + 1)
+    mon.write(numStr)
+
+    -- Big bar at the bottom (4 rows tall if room)
+    local barTop = h - 4
+    local barBot = h - 1
+    if barTop < pctY + 3 then barTop = pctY + 3 end
+    if barBot < barTop then barBot = barTop end
+
+    local barX1, barX2 = 2, w - 1
+    local barW = barX2 - barX1 + 1
+    local filled = math.floor(barW * pct / 100 + 0.5)
+    if filled < 0 then filled = 0 end
+    if filled > barW then filled = barW end
+
+    for y = barTop, barBot do
+        mon.setCursorPos(barX1, y)
+        mon.setBackgroundColor(color)
+        mon.write(string.rep(" ", filled))
+        mon.setBackgroundColor(colors.gray)
+        mon.write(string.rep(" ", barW - filled))
+    end
+    mon.setBackgroundColor(colors.black)
+
+    -- Status label under the bar (or above if no room)
+    if h >= 12 then
+        local label = (pct >= 100) and "OVERSTRESSED" or
+                      (pct >= 90)  and "CRITICAL"     or
+                      (pct >= 70)  and "HIGH"         or
+                      (pct >= 30)  and "OK"           or "IDLE"
+        mon.setTextColor(color)
+        mon.setCursorPos(math.floor((w - #label) / 2) + 1, h)
+        mon.write(label)
+    end
+end
+
+-- ============================================ ANIMATION MONITOR (Matrix rain) ============================================
+
+local matrixState = nil  -- {cols={[col]={head=y, length=L, chars=[]}}, w, h, charset}
+
+local function initMatrix(w, h)
+    matrixState = { w = w, h = h, cols = {} }
+    -- Use ASCII printable characters (Code Page 437 / CC-friendly subset)
+    matrixState.charset = "01@#$%&*+=<>{}[]/\\|abcdefghijklmnopqrstuvwxyz0123456789"
+    for c = 1, w do
+        matrixState.cols[c] = nil  -- no drop active in this column initially
+    end
+end
+
+local function randomChar()
+    if not matrixState then return "0" end
+    local cs = matrixState.charset
+    local i = math.random(1, #cs)
+    return cs:sub(i, i)
+end
+
+local function tickMatrix(mon, w, h)
+    if not matrixState or matrixState.w ~= w or matrixState.h ~= h then
+        initMatrix(w, h)
+        mon.setBackgroundColor(colors.black); mon.clear()
+    end
+
+    -- Process each column: advance existing drops, possibly start new ones
+    for c = 1, w do
+        local drop = matrixState.cols[c]
+        if drop then
+            drop.head = drop.head + 1
+            -- Add a new char at the new head
+            if drop.head <= h then
+                drop.chars[drop.head] = randomChar()
+            end
+            -- The "tail" position 'length' steps back disappears
+            local clearY = drop.head - drop.length
+            if clearY >= 1 and clearY <= h then
+                mon.setCursorPos(c, clearY)
+                mon.setBackgroundColor(colors.black)
+                mon.write(" ")
+            end
+            -- Once head goes past bottom by length+random, drop ends
+            if drop.head > h + drop.length then
+                matrixState.cols[c] = nil
+            else
+                -- Repaint trail with fading colors
+                for y = math.max(1, drop.head - drop.length + 1), math.min(h, drop.head) do
+                    local distFromHead = drop.head - y
+                    local color
+                    if distFromHead == 0      then color = colors.white
+                    elseif distFromHead == 1  then color = colors.lime
+                    elseif distFromHead <= 3  then color = colors.green
+                    elseif distFromHead <= drop.length - 2 then color = colors.gray
+                    else color = colors.black end
+                    if color ~= colors.black and drop.chars[y] then
+                        mon.setCursorPos(c, y)
+                        mon.setBackgroundColor(colors.black)
+                        mon.setTextColor(color)
+                        mon.write(drop.chars[y])
+                    end
+                end
+            end
+        else
+            -- Random chance to spawn a new drop in this column
+            if math.random(1, 18) == 1 then
+                matrixState.cols[c] = {
+                    head = 0,
+                    length = math.random(4, math.max(5, math.floor(h * 0.7))),
+                    chars = {},
+                }
+            end
+        end
+    end
+end
+
+local function drawAnimMonitor()
+    local mon = getAnimMon(); if not mon then return end
+    local _, w, h = autoScale(mon, 12, 8)
+    tickMatrix(mon, w, h)
 end
 
 -- ============================================ SETTINGS SCREEN ============================================
@@ -287,32 +419,39 @@ end
 local function drawSettings()
     local mon = getMon(); if not mon then return end
     layoutCache = {}
-    local _, w, h = autoScale(mon, 16, 8)
+    local _, w, h = autoScale(mon, 22, 12)
     mon.setBackgroundColor(colors.black); mon.clear()
 
     drawHeader(mon, w, "SETTINGS", colors.purple)
 
-    -- Monitor row
-    mon.setTextColor(colors.lightGray)
-    mon.setCursorPos(2, 3); mon.write("Monitor:")
-    mon.setTextColor(colors.white)
-    local mn = config.monitor or "(this one)"
-    if #mn > w - 4 then mn = mn:sub(1, w - 5) .. "." end
-    mon.setCursorPos(2, 4); mon.write(mn)
+    local function monRow(y, label, value, action)
+        mon.setBackgroundColor(colors.black)
+        mon.setTextColor(colors.lightGray)
+        mon.setCursorPos(2, y); mon.write(label)
+        mon.setTextColor(value and colors.white or colors.gray)
+        local v = value or "(none)"
+        local maxLen = w - 11
+        if #v > maxLen then v = v:sub(1, maxLen - 1) .. "." end
+        mon.setCursorPos(2, y + 1); mon.write(v)
+        drawBtn(mon, w - 6, y, w - 1, y, "[SET]", colors.blue, colors.white, action)
+    end
+
+    monRow(3, "Control monitor:", config.controlMonitor, "set_ctrl")
+    monRow(5, "Stress monitor:",  config.stressMonitor,  "set_stress")
+    monRow(7, "Anim monitor:",    config.animMonitor,    "set_anim")
 
     mon.setTextColor(colors.gray)
-    mon.setCursorPos(2, 5); mon.write(string.rep("-", w - 2))
+    mon.setCursorPos(2, 9); mon.write(string.rep("-", w - 2))
 
-    -- Farms list
     mon.setTextColor(colors.lightGray)
-    mon.setCursorPos(2, 6); mon.write("Farms (" .. #config.farms .. "):")
+    mon.setCursorPos(2, 10); mon.write("Farms (" .. #config.farms .. "):")
 
-    local listTop = 7
+    local listTop = 11
     local listBottom = h - 3
 
     if #config.farms == 0 then
         mon.setTextColor(colors.gray)
-        mon.setCursorPos(2, listTop + 1); mon.write("(none)")
+        mon.setCursorPos(2, listTop); mon.write("(none)")
     else
         local y = listTop
         for _, f in ipairs(config.farms) do
@@ -321,15 +460,56 @@ local function drawSettings()
             if #nm > w - 8 then nm = nm:sub(1, w - 9) .. "." end
             mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white)
             mon.setCursorPos(2, y); mon.write(nm)
-            -- Delete button
             drawBtn(mon, w - 5, y, w - 1, y, "[DEL]", colors.red, colors.white, "del_" .. f.id)
             y = y + 1
         end
     end
 
-    -- Add farm button + back
     drawBtn(mon, 2, h - 2, w - 1, h - 2, "[ + ADD FARM ]", colors.green, colors.white, "add_farm")
     drawBtn(mon, 2, h, w - 1, h, "[ < BACK ]", colors.gray, colors.white, "back")
+end
+
+-- ============================================ MONITOR PICKER SCREEN ============================================
+
+local function drawPickMonitor()
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 16, 8)
+    mon.setBackgroundColor(colors.black); mon.clear()
+
+    local titleByTarget = {
+        control = "PICK CONTROL MON",
+        stress  = "PICK STRESS MON",
+        anim    = "PICK ANIM MON",
+    }
+    drawHeader(mon, w, titleByTarget[pickerTarget] or "PICK MONITOR", colors.purple)
+
+    local mons = listByType("monitor")
+    if #mons == 0 then
+        mon.setTextColor(colors.red)
+        centerText(mon, w, math.floor(h / 2), "No monitors!", colors.red)
+    else
+        local y = 3
+        -- Add "(none)" option to clear the assignment
+        drawBtn(mon, 2, y, w - 1, y, " (none - clear) ", colors.gray, colors.white, "pick_none")
+        y = y + 1
+        for i, n in ipairs(mons) do
+            if y > h - 2 then break end
+            local nm = n
+            if #nm > w - 4 then nm = nm:sub(1, w - 5) .. "." end
+            -- Mark which is currently used and as what
+            local marker = ""
+            if n == config.controlMonitor then marker = " [CTRL]"
+            elseif n == config.stressMonitor then marker = " [STRESS]"
+            elseif n == config.animMonitor then marker = " [ANIM]" end
+            local label = " " .. nm .. marker
+            if #label > w - 3 then label = label:sub(1, w - 4) end
+            drawBtn(mon, 2, y, w - 1, y, label, colors.gray, colors.white, "pick_" .. i)
+            y = y + 1
+        end
+    end
+
+    drawBtn(mon, 2, h, 11, h, "[CANCEL]", colors.gray, colors.white, "cancel")
 end
 
 -- ============================================ ADD FARM WIZARD ============================================
@@ -369,7 +549,7 @@ local function drawAddName()
     -- Need ~40 cols for 10 columns of 3-wide buttons + gaps
     local _, w, h = autoScale(mon, 40, 12)
     mon.setBackgroundColor(colors.black); mon.clear()
-    drawHeader(mon, w, "NAME", colors.green)
+    drawHeader(mon, w, "FARM NAME", colors.green)
 
     -- Display field
     mon.setBackgroundColor(colors.gray); mon.setTextColor(colors.yellow)
@@ -478,6 +658,7 @@ local function drawCurrent()
     elseif screen == "add_name" then drawAddName()
     elseif screen == "add_relay" then drawAddRelay()
     elseif screen == "add_side" then drawAddSide()
+    elseif screen == "pick_monitor" then drawPickMonitor()
     end
 end
 
@@ -494,8 +675,13 @@ end
 local function handleAction(action)
     -- Universal cancel
     if action == "cancel" then
-        addDraft = nil; addBuf = ""
-        screen = "settings"
+        if screen == "pick_monitor" then
+            pickerTarget = nil
+            screen = "settings"
+        else
+            addDraft = nil; addBuf = ""
+            screen = "settings"
+        end
         drawCurrent()
         return
     end
@@ -514,9 +700,11 @@ local function handleAction(action)
         if action == "add_farm" then
             addDraft = {}; addBuf = ""; screen = "add_name"; drawCurrent(); return
         end
+        if action == "set_ctrl"   then pickerTarget = "control"; screen = "pick_monitor"; drawCurrent(); return end
+        if action == "set_stress" then pickerTarget = "stress";  screen = "pick_monitor"; drawCurrent(); return end
+        if action == "set_anim"   then pickerTarget = "anim";    screen = "pick_monitor"; drawCurrent(); return end
         if action:sub(1, 4) == "del_" then
             local id = action:sub(5)
-            -- Remove and stop the relay (turn farm off in inverted = relay HIGH)
             for i, f in ipairs(config.farms) do
                 if f.id == id then
                     f.enabled = false; applyFarm(f)
@@ -526,6 +714,39 @@ local function handleAction(action)
             end
             saveConfig()
             drawCurrent()
+            return
+        end
+
+    elseif screen == "pick_monitor" then
+        local function setForTarget(value)
+            if pickerTarget == "control" then config.controlMonitor = value
+            elseif pickerTarget == "stress" then config.stressMonitor = value
+            elseif pickerTarget == "anim" then
+                config.animMonitor = value
+                matrixState = nil  -- reset animation
+                -- If we cleared anim monitor, blank it
+                if not value then
+                    -- Cannot blank a screen we no longer reference; previous monitor will simply stop being updated
+                end
+            end
+            saveConfig()
+            -- Reset matrix state when anim changes
+            if pickerTarget == "anim" then matrixState = nil end
+        end
+
+        if action == "pick_none" then
+            setForTarget(nil)
+            screen = "settings"; drawCurrent(); return
+        end
+        if action:sub(1, 5) == "pick_" then
+            local idx = tonumber(action:sub(6))
+            if idx then
+                local mons = listByType("monitor")
+                if mons[idx] then
+                    setForTarget(mons[idx])
+                    screen = "settings"; drawCurrent()
+                end
+            end
             return
         end
 
@@ -592,27 +813,27 @@ local function pickMonitor()
     local mons = listByType("monitor")
     if #mons == 0 then
         print("No monitors detected.")
-        print("Connect a monitor and reboot.")
+        print("Connect at least one monitor (control) and reboot.")
         while true do sleep(5) end
     end
 
     if #mons == 1 then
-        config.monitor = mons[1]
+        config.controlMonitor = mons[1]
         saveConfig()
         return
     end
 
-    print("=== CONTROLLER ===")
-    print("Multiple monitors found:")
-    for i, n in ipairs(mons) do
-        print("  " .. i .. ". " .. n)
-    end
+    print("=== STRESS CONTROL ===")
+    print("Pick the CONTROL monitor (the touch UI).")
+    print("Stress and anim monitors can be set later via Settings.")
+    print("")
+    for i, n in ipairs(mons) do print("  " .. i .. ". " .. n) end
     while true do
         write("Select 1-" .. #mons .. ": ")
         local line = read()
         local n = tonumber(line)
         if n and mons[n] then
-            config.monitor = mons[n]
+            config.controlMonitor = mons[n]
             saveConfig()
             return
         end
@@ -623,22 +844,24 @@ end
 
 local function showConsoleSummary()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
-    term.setTextColor(colors.cyan); print("=== CONTROLLER v1.0 ===")
+    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.1 ===")
     term.setTextColor(colors.white)
-    print("Monitor: " .. (config.monitor or "?"))
+    print("Control: " .. (config.controlMonitor or "?"))
+    print("Stress:  " .. (config.stressMonitor or "(none)"))
+    print("Anim:    " .. (config.animMonitor or "(none)"))
     print("Farms:   " .. #config.farms)
     if stressData and stressData.capacity > 0 then
         local pct = math.floor(stressData.current / stressData.capacity * 100 + 0.5)
         term.setTextColor(colors.lightGray)
-        print(("Stress:  %d/%d SU (%d%%)"):format(
+        print(("SU:      %d/%d (%d%%)"):format(
             math.floor(stressData.current),
             math.floor(stressData.capacity), pct))
     elseif stressData then
         term.setTextColor(colors.yellow)
-        print(("Stress:  %d SU (network idle)"):format(math.floor(stressData.current)))
+        print(("SU:      %d (network idle)"):format(math.floor(stressData.current)))
     else
         term.setTextColor(colors.gray)
-        print("Stress:  (no stressometer connected)")
+        print("SU:      (no stressometer)")
     end
     if #config.farms > 0 then
         print("")
@@ -649,7 +872,6 @@ local function showConsoleSummary()
         end
     end
     term.setTextColor(colors.gray); print("")
-    print("Use the touch monitor to manage farms.")
     print("[R] reboot   [W] wipe state")
 end
 
@@ -678,44 +900,56 @@ end
 local function monitorLoop()
     readStress()
     drawCurrent()
+    drawStressMonitor()
+    drawAnimMonitor()
+
     local stressTimer = os.startTimer(1)
+    local animTimer   = os.startTimer(0.2)  -- 5 fps
+
     while true do
         local ev = { os.pullEvent() }
         if ev[1] == "monitor_touch" then
             local n, x, y = ev[2], ev[3], ev[4]
-            if n == config.monitor then
+            if n == config.controlMonitor then
                 local action = findClicked(x, y)
                 if action then handleAction(action) end
             end
-        elseif ev[1] == "timer" and ev[2] == stressTimer then
-            local prev = stressData
-            readStress()
-            -- Only redraw main screen if stress actually changed (avoids flicker)
-            if screen == "main" then
-                local changed = false
-                if (prev == nil) ~= (stressData == nil) then
-                    changed = true
-                elseif prev and stressData then
-                    if math.abs(prev.current - stressData.current) > 0.5
-                       or prev.capacity ~= stressData.capacity then
-                        changed = true
-                    end
-                end
-                if changed then drawCurrent() end
+            -- Touches on stress/anim monitors are ignored
+
+        elseif ev[1] == "timer" then
+            if ev[2] == stressTimer then
+                local prev = stressData
+                readStress()
+                -- Always redraw stress monitor (changes anyway)
+                drawStressMonitor()
+                stressTimer = os.startTimer(1)
+            elseif ev[2] == animTimer then
+                drawAnimMonitor()
+                animTimer = os.startTimer(0.2)
             end
-            stressTimer = os.startTimer(1)
+
         elseif ev[1] == "peripheral" then
-            -- New peripheral attached; check if it's a stressometer
+            -- A peripheral attached: re-resolve stress and redraw all
             readStress()
-            if screen == "main" then drawCurrent() end
-        elseif ev[1] == "peripheral_detach" then
-            -- Maybe stressometer disconnected
-            if stressData and ev[2] == stressData.name then
-                stressData = nil
-                if screen == "main" then drawCurrent() end
-            end
-        elseif ev[1] == "monitor_resize" then
             drawCurrent()
+            drawStressMonitor()
+            drawAnimMonitor()
+
+        elseif ev[1] == "peripheral_detach" then
+            local n = ev[2]
+            if stressData and n == stressData.name then
+                stressData = nil
+                drawStressMonitor()
+            end
+            if n == config.animMonitor then
+                matrixState = nil
+            end
+
+        elseif ev[1] == "monitor_resize" then
+            local n = ev[2]
+            if n == config.controlMonitor then drawCurrent()
+            elseif n == config.stressMonitor then drawStressMonitor()
+            elseif n == config.animMonitor then matrixState = nil; drawAnimMonitor() end
         end
     end
 end
@@ -724,12 +958,11 @@ end
 
 loadConfig()
 
-if not config.monitor or not peripheral.wrap(config.monitor) then
+if not config.controlMonitor or not peripheral.wrap(config.controlMonitor) then
     pickMonitor()
 end
 
 -- Apply current state to all relays so reboot doesn't leave farms in random state.
--- Note: by inverted logic, "enabled=false" means relay HIGH = farm physically off.
 applyAllFarms()
 
 parallel.waitForAny(monitorLoop, consoleLoop)
