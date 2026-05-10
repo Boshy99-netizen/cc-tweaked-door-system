@@ -18,6 +18,32 @@ local addDraft = nil   -- draft farm during add wizard
 local prevHash = nil   -- anti-flicker hash
 local layoutCache = nil -- cached button rectangles for current draw
 
+-- Stressometer (Create mod)
+local stressData = nil  -- {current, capacity, name} or nil if no stressometer
+
+local function readStress()
+    -- Find first stressometer-type peripheral
+    local stressTypes = { "Create_Stressometer", "create:stressometer", "stressometer" }
+    for _, n in ipairs(peripheral.getNames()) do
+        local t = peripheral.getType(n)
+        for _, st in ipairs(stressTypes) do
+            if t == st then
+                local p = peripheral.wrap(n)
+                if p then
+                    local okC, cur = pcall(p.getStress)
+                    local okM, max = pcall(p.getStressCapacity)
+                    if okC and okM and cur and max then
+                        stressData = { current = cur, capacity = max, name = n }
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    stressData = nil
+    return false
+end
+
 -- ============================================ UTILS ============================================
 
 local function genId()
@@ -162,10 +188,55 @@ local function drawMain(force)
     local _, w, h = autoScale(mon, 16, 8)
     mon.setBackgroundColor(colors.black); mon.clear()
 
-    drawHeader(mon, w, "CONTROL", colors.cyan)
+    drawHeader(mon, w, "FARM CONTROL", colors.cyan)
+
+    -- Stress display row (uses 2 rows when stressometer present)
+    local listTop = 3
+    if stressData then
+        local cur = stressData.current
+        local cap = stressData.capacity
+        local pct = (cap > 0) and (cur / cap * 100) or 0
+        if pct > 100 then pct = 100 end
+        if pct < 0 then pct = 0 end
+
+        -- Color by load: <70 lime, <90 yellow, <100 orange, >=100 red
+        local color = colors.lime
+        if pct >= 100 then color = colors.red
+        elseif pct >= 90 then color = colors.orange
+        elseif pct >= 70 then color = colors.yellow
+        end
+
+        -- Line 1: "Stress: 1234/2048 SU"
+        mon.setBackgroundColor(colors.black); mon.setTextColor(colors.lightGray)
+        mon.setCursorPos(2, 3); mon.write("Stress:")
+        local txt = string.format("%d/%d SU", math.floor(cur), math.floor(cap))
+        mon.setTextColor(color)
+        if #txt > w - 11 then txt = txt:sub(1, w - 11) end
+        mon.setCursorPos(w - #txt, 3); mon.write(txt)
+
+        -- Line 2: progress bar with percentage
+        local barX1, barX2 = 2, w - 7
+        local barW = barX2 - barX1 + 1
+        local filled = math.floor(barW * pct / 100 + 0.5)
+        if filled < 0 then filled = 0 end
+        if filled > barW then filled = barW end
+        mon.setCursorPos(barX1, 4)
+        mon.setBackgroundColor(color)
+        mon.write(string.rep(" ", filled))
+        mon.setBackgroundColor(colors.gray)
+        mon.write(string.rep(" ", barW - filled))
+        mon.setBackgroundColor(colors.black)
+        local pctStr = string.format("%d%%", math.floor(pct + 0.5))
+        mon.setTextColor(color)
+        mon.setCursorPos(w - #pctStr, 4); mon.write(pctStr)
+
+        -- Separator
+        mon.setTextColor(colors.gray)
+        mon.setCursorPos(2, 5); mon.write(string.rep("-", w - 2))
+        listTop = 6
+    end
 
     -- Footer reserved: 1 row at bottom for [SETTINGS]
-    local listTop = 3
     local listBottom = h - 2
 
     if #config.farms == 0 then
@@ -173,8 +244,6 @@ local function drawMain(force)
         centerText(mon, w, math.floor((listTop + listBottom) / 2), "No farms yet", colors.gray)
         centerText(mon, w, math.floor((listTop + listBottom) / 2) + 1, "Tap [SETTINGS]", colors.gray)
     else
-        -- Each farm row: name on left, ON/OFF button on right
-        -- Row height: prefer 2 rows per farm if space allows, else 1
         local nFarms = #config.farms
         local available = listBottom - listTop + 1
         local rowH = math.min(3, math.max(1, math.floor(available / nFarms)))
@@ -199,16 +268,10 @@ local function drawMain(force)
             -- Status pill on right
             local btnX2 = w - 1
             local btnX1 = btnX2 - btnW + 1
-            local btnY1 = rowTop
-            local btnY2 = rowBot
-            if rowH > 1 then
-                btnY1 = rowTop
-                btnY2 = rowBot
-            end
             local label = f.enabled and "ON" or "OFF"
             local bg = f.enabled and colors.lime or colors.gray
             local fg = f.enabled and colors.black or colors.white
-            drawBtn(mon, btnX1, btnY1, btnX2, btnY2, label, bg, fg, "toggle_" .. f.id)
+            drawBtn(mon, btnX1, rowTop, btnX2, rowBot, label, bg, fg, "toggle_" .. f.id)
         end
     end
 
@@ -268,55 +331,87 @@ end
 
 -- ============================================ ADD FARM WIZARD ============================================
 
-local PAD_KEYS_TEXT = {
-    {"Q","W","E","R","T","Y","U","I","O","P"},
-    {"A","S","D","F","G","H","J","K","L","_"},
-    {"Z","X","C","V","B","N","M","-","<","OK"},
+-- Keyboard: 4 rows x 10 cols. Row 4 has Shift, space, backspace, OK.
+local KB_ROWS = {
+    {"1","2","3","4","5","6","7","8","9","0"},
+    {"q","w","e","r","t","y","u","i","o","p"},
+    {"a","s","d","f","g","h","j","k","l","_"},
+    {"Sh","z","x","c","v","b","n","m","<","OK"},
 }
--- "<" = backspace (one char), "OK" = submit (two chars wide ideally)
+local kbShift = false  -- when true, letters render uppercase
+
+-- Returns the visible label for a key cell given shift state
+local function kbLabel(raw, shift)
+    if raw == "Sh" then return shift and "SH" or "Sh" end
+    if raw == "OK" or raw == "<" or raw == "_" then return raw end
+    if #raw == 1 and raw:match("%a") then
+        return shift and raw:upper() or raw:lower()
+    end
+    return raw  -- digits
+end
+
+-- Returns what to insert into the buffer (or special tokens)
+local function kbInsert(raw, shift)
+    if raw == "Sh" or raw == "OK" or raw == "<" then return raw end
+    if raw == "_" then return " " end
+    if #raw == 1 and raw:match("%a") then
+        return shift and raw:upper() or raw:lower()
+    end
+    return raw
+end
 
 local function drawAddName()
     local mon = getMon(); if not mon then return end
     layoutCache = {}
-    local _, w, h = autoScale(mon, 22, 10)
+    -- Need ~40 cols for 10 columns of 3-wide buttons + gaps
+    local _, w, h = autoScale(mon, 40, 12)
     mon.setBackgroundColor(colors.black); mon.clear()
     drawHeader(mon, w, "FARM NAME", colors.green)
 
     -- Display field
     mon.setBackgroundColor(colors.gray); mon.setTextColor(colors.yellow)
-    local field = " " .. addBuf .. string.rep(" ", w - #addBuf - 3) .. " "
+    local shown = addBuf
+    if #shown > w - 4 then shown = shown:sub(-(w - 4)) end
+    local field = " " .. shown .. string.rep(" ", w - #shown - 3) .. " "
     mon.setCursorPos(2, 3); mon.write(field)
 
     mon.setTextColor(colors.gray); mon.setBackgroundColor(colors.black)
     centerText(mon, w, 4, "Tap letters then OK", colors.gray)
 
-    -- Keyboard area: starts y=5
+    -- Keyboard area: 4 rows
     local kbTop = 5
     local kbBot = h - 2
     local kbH = kbBot - kbTop + 1
-    local rows = #PAD_KEYS_TEXT
-    local rowH = math.max(1, math.floor((kbH - (rows - 1)) / rows))
+    local rows = #KB_ROWS  -- 4
+    local rowH = 2
     if rowH * rows + (rows - 1) > kbH then rowH = 1 end
 
     local cols = 10
-    local btnW = math.max(2, math.floor((w - 2 - (cols - 1)) / cols))
-    if btnW < 2 then btnW = 2 end
+    local btnW = math.max(3, math.floor((w - 2 - (cols - 1)) / cols))
     local gridW = btnW * cols + (cols - 1)
     local startX = math.floor((w - gridW) / 2) + 1
     if startX < 2 then startX = 2 end
 
     for r = 1, rows do
         for c = 1, cols do
-            local ch = PAD_KEYS_TEXT[r][c]
+            local raw = KB_ROWS[r][c]
             local x1 = startX + (c - 1) * (btnW + 1)
             local y1 = kbTop + (r - 1) * (rowH + 1)
             local x2 = x1 + btnW - 1
             local y2 = y1 + rowH - 1
             if y2 > kbBot then break end
+
             local bg, fg = colors.lightGray, colors.black
-            if ch == "OK" then bg, fg = colors.green, colors.white
-            elseif ch == "<" then bg, fg = colors.red, colors.white end
-            local label = ch
+            if raw == "OK"  then bg, fg = colors.green, colors.white
+            elseif raw == "<"  then bg, fg = colors.red, colors.white
+            elseif raw == "Sh" then
+                if kbShift then bg, fg = colors.yellow, colors.black
+                else            bg, fg = colors.cyan,   colors.black end
+            elseif raw == "_" then bg, fg = colors.lightBlue, colors.black
+            elseif raw:match("^%d$") then bg, fg = colors.white, colors.black
+            end
+
+            local label = kbLabel(raw, kbShift)
             if #label > btnW then label = label:sub(1, btnW) end
             drawBtn(mon, x1, y1, x2, y2, label, bg, fg, "kb_" .. r .. "_" .. c)
         end
@@ -435,16 +530,22 @@ local function handleAction(action)
         if action:sub(1, 3) == "kb_" then
             local r, c = action:match("kb_(%d+)_(%d+)")
             r, c = tonumber(r), tonumber(c)
-            local ch = PAD_KEYS_TEXT[r][c]
-            if ch == "OK" then
+            local raw = KB_ROWS[r][c]
+            local token = kbInsert(raw, kbShift)
+
+            if token == "OK" then
                 if #addBuf == 0 then return end
                 addDraft.name = addBuf
                 addBuf = ""
+                kbShift = false
                 screen = "add_relay"; drawCurrent()
-            elseif ch == "<" then
+            elseif token == "<" then
                 if #addBuf > 0 then addBuf = addBuf:sub(1, -2); drawCurrent() end
+            elseif token == "Sh" then
+                kbShift = not kbShift
+                drawCurrent()
             else
-                if #addBuf < 16 then addBuf = addBuf .. ch; drawCurrent() end
+                if #addBuf < 24 then addBuf = addBuf .. token; drawCurrent() end
             end
             return
         end
@@ -523,6 +624,16 @@ local function showConsoleSummary()
     term.setTextColor(colors.white)
     print("Monitor: " .. (config.monitor or "?"))
     print("Farms:   " .. #config.farms)
+    if stressData then
+        local pct = math.floor(stressData.current / stressData.capacity * 100 + 0.5)
+        term.setTextColor(colors.lightGray)
+        print(("Stress:  %d/%d SU (%d%%)"):format(
+            math.floor(stressData.current),
+            math.floor(stressData.capacity), pct))
+    else
+        term.setTextColor(colors.gray)
+        print("Stress:  (no stressometer connected)")
+    end
     if #config.farms > 0 then
         print("")
         for _, f in ipairs(config.farms) do
@@ -559,7 +670,9 @@ local function consoleLoop()
 end
 
 local function monitorLoop()
+    readStress()
     drawCurrent()
+    local stressTimer = os.startTimer(1)
     while true do
         local ev = { os.pullEvent() }
         if ev[1] == "monitor_touch" then
@@ -568,11 +681,33 @@ local function monitorLoop()
                 local action = findClicked(x, y)
                 if action then handleAction(action) end
             end
+        elseif ev[1] == "timer" and ev[2] == stressTimer then
+            local prev = stressData
+            readStress()
+            -- Only redraw main screen if stress actually changed (avoids flicker)
+            if screen == "main" then
+                local changed = false
+                if (prev == nil) ~= (stressData == nil) then
+                    changed = true
+                elseif prev and stressData then
+                    if math.abs(prev.current - stressData.current) > 0.5
+                       or prev.capacity ~= stressData.capacity then
+                        changed = true
+                    end
+                end
+                if changed then drawCurrent() end
+            end
+            stressTimer = os.startTimer(1)
         elseif ev[1] == "peripheral" then
-            -- New peripheral attached: redraw in case it was our monitor reconnecting
-            drawCurrent()
+            -- New peripheral attached; check if it's a stressometer
+            readStress()
+            if screen == "main" then drawCurrent() end
         elseif ev[1] == "peripheral_detach" then
-            -- Monitor unplugged or relay gone - nothing to do; will recover on next draw
+            -- Maybe stressometer disconnected
+            if stressData and ev[2] == stressData.name then
+                stressData = nil
+                if screen == "main" then drawCurrent() end
+            end
         elseif ev[1] == "monitor_resize" then
             drawCurrent()
         end
