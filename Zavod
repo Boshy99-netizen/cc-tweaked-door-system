@@ -32,7 +32,10 @@ local function readStress()
                 if p then
                     local okC, cur = pcall(p.getStress)
                     local okM, max = pcall(p.getStressCapacity)
-                    if okC and okM and cur and max then
+                    -- Both must be numbers, capacity must be positive
+                    if okC and okM
+                       and type(cur) == "number" and type(max) == "number"
+                       and max > 0 then
                         stressData = { current = cur, capacity = max, name = n }
                         return true
                     end
@@ -192,10 +195,10 @@ local function drawMain(force)
 
     -- Stress display row (uses 2 rows when stressometer present)
     local listTop = 3
-    if stressData then
+    if stressData and stressData.capacity > 0 then
         local cur = stressData.current
         local cap = stressData.capacity
-        local pct = (cap > 0) and (cur / cap * 100) or 0
+        local pct = cur / cap * 100
         if pct > 100 then pct = 100 end
         if pct < 0 then pct = 0 end
 
@@ -624,12 +627,15 @@ local function showConsoleSummary()
     term.setTextColor(colors.white)
     print("Monitor: " .. (config.monitor or "?"))
     print("Farms:   " .. #config.farms)
-    if stressData then
+    if stressData and stressData.capacity > 0 then
         local pct = math.floor(stressData.current / stressData.capacity * 100 + 0.5)
         term.setTextColor(colors.lightGray)
         print(("Stress:  %d/%d SU (%d%%)"):format(
             math.floor(stressData.current),
             math.floor(stressData.capacity), pct))
+    elseif stressData then
+        term.setTextColor(colors.yellow)
+        print(("Stress:  %d SU (network idle)"):format(math.floor(stressData.current)))
     else
         term.setTextColor(colors.gray)
         print("Stress:  (no stressometer connected)")
