@@ -1,0 +1,594 @@
+-- ============================================
+-- CONTROLLER v1.0
+-- Standalone program for toggling farms via inverted redstone relays.
+-- Relay HIGH = farm OFF (powered = stops the contraption)
+-- Relay LOW  = farm ON  (no signal = farm runs)
+-- ============================================
+
+-- ============================================ STATE ============================================
+
+local config = {
+    monitor = nil,    -- monitor name (touch surface)
+    farms   = {},     -- list of {id, name, relay, relaySide, enabled}
+}
+
+local screen = "main"  -- main, settings, add_name, add_relay, add_side
+local addBuf = ""      -- text buffer for "Add farm: name" input
+local addDraft = nil   -- draft farm during add wizard
+local prevHash = nil   -- anti-flicker hash
+local layoutCache = nil -- cached button rectangles for current draw
+
+-- ============================================ UTILS ============================================
+
+local function genId()
+    local i = 1
+    while true do
+        local exists = false
+        for _, f in ipairs(config.farms) do
+            if f.id == "farm_" .. i then exists = true; break end
+        end
+        if not exists then return "farm_" .. i end
+        i = i + 1
+    end
+end
+
+local function findFarm(id)
+    for _, f in ipairs(config.farms) do
+        if f.id == id then return f end
+    end
+end
+
+local function listByType(t)
+    local r = {}
+    for _, n in ipairs(peripheral.getNames()) do
+        if peripheral.getType(n) == t then table.insert(r, n) end
+    end
+    table.sort(r); return r
+end
+
+local SIDES = { "top", "bottom", "left", "right", "front", "back" }
+
+-- ============================================ PERSISTENCE ============================================
+
+local function saveConfig()
+    local ok, txt = pcall(textutils.serialize, config)
+    if not ok then return end
+    local f = fs.open("farms.dat", "w")
+    if f then f.write(txt); f.close() end
+end
+
+local function loadConfig()
+    if not fs.exists("farms.dat") then return false end
+    local f = fs.open("farms.dat", "r"); if not f then return false end
+    local txt = f.readAll(); f.close()
+    local ok, decoded = pcall(textutils.unserialize, txt)
+    if not ok or type(decoded) ~= "table" then return false end
+    config.monitor = decoded.monitor
+    config.farms   = decoded.farms or {}
+    return true
+end
+
+-- ============================================ RELAY CONTROL ============================================
+
+local function applyFarm(farm)
+    if not farm.relay or farm.relay == "" then return end
+    local r = peripheral.wrap(farm.relay)
+    if not r or not r.setOutput then return end
+    -- Inverted: enabled=true means signal LOW, disabled=true means signal HIGH
+    pcall(r.setOutput, farm.relaySide or "top", not farm.enabled)
+end
+
+local function applyAllFarms()
+    for _, f in ipairs(config.farms) do applyFarm(f) end
+end
+
+local function setFarmEnabled(id, on)
+    local f = findFarm(id); if not f then return end
+    f.enabled = on
+    applyFarm(f)
+    saveConfig()
+end
+
+local function toggleFarm(id)
+    local f = findFarm(id); if not f then return end
+    setFarmEnabled(id, not f.enabled)
+end
+
+-- ============================================ MONITOR HELPERS ============================================
+
+local function getMon()
+    if not config.monitor then return nil end
+    local m = peripheral.wrap(config.monitor)
+    if not m then return nil end
+    return m
+end
+
+local function fillRect(mon, x1, y1, x2, y2, bg)
+    mon.setBackgroundColor(bg)
+    for y = y1, y2 do
+        mon.setCursorPos(x1, y)
+        mon.write(string.rep(" ", x2 - x1 + 1))
+    end
+end
+
+-- Find best text scale that gives at least minW x minH characters of usable space
+local function autoScale(mon, minW, minH)
+    local SCALES = { 1, 0.5, 1.5, 2, 2.5, 3 }
+    for _, s in ipairs(SCALES) do
+        pcall(mon.setTextScale, s)
+        local w, h = mon.getSize()
+        if w >= minW and h >= minH then
+            return s, w, h
+        end
+    end
+    pcall(mon.setTextScale, 0.5)
+    local w, h = mon.getSize()
+    return 0.5, w, h
+end
+
+local function drawHeader(mon, w, title, color)
+    color = color or colors.gray
+    mon.setBackgroundColor(color); mon.setTextColor(colors.white)
+    for x = 1, w do mon.setCursorPos(x, 1); mon.write(" ") end
+    local t = title
+    if #t > w - 2 then t = t:sub(1, w - 2) end
+    mon.setCursorPos(math.floor((w - #t) / 2) + 1, 1); mon.write(t)
+    mon.setBackgroundColor(colors.black)
+end
+
+local function drawBtn(mon, x1, y1, x2, y2, text, bg, fg, action)
+    fillRect(mon, x1, y1, x2, y2, bg)
+    local cx = x1 + math.floor(((x2 - x1 + 1) - #text) / 2)
+    local cy = y1 + math.floor((y2 - y1) / 2)
+    mon.setCursorPos(cx, cy); mon.setTextColor(fg)
+    mon.write(text)
+    mon.setBackgroundColor(colors.black)
+    if action and layoutCache then
+        layoutCache[action] = { x1 = x1, y1 = y1, x2 = x2, y2 = y2 }
+    end
+end
+
+local function centerText(mon, w, y, text, color)
+    if color then mon.setTextColor(color) end
+    mon.setCursorPos(math.floor((w - #text) / 2) + 1, y)
+    mon.write(text)
+end
+
+-- ============================================ MAIN SCREEN ============================================
+
+local function drawMain(force)
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 16, 8)
+    mon.setBackgroundColor(colors.black); mon.clear()
+
+    drawHeader(mon, w, "CONTROL", colors.cyan)
+
+    -- Footer reserved: 1 row at bottom for [SETTINGS]
+    local listTop = 3
+    local listBottom = h - 2
+
+    if #config.farms == 0 then
+        mon.setTextColor(colors.gray)
+        centerText(mon, w, math.floor((listTop + listBottom) / 2), "No farms yet", colors.gray)
+        centerText(mon, w, math.floor((listTop + listBottom) / 2) + 1, "Tap [SETTINGS]", colors.gray)
+    else
+        -- Each farm row: name on left, ON/OFF button on right
+        -- Row height: prefer 2 rows per farm if space allows, else 1
+        local nFarms = #config.farms
+        local available = listBottom - listTop + 1
+        local rowH = math.min(3, math.max(1, math.floor(available / nFarms)))
+        if rowH > 1 and nFarms * rowH > available then rowH = 1 end
+
+        local btnW = math.min(8, math.floor(w / 4))
+        if btnW < 5 then btnW = 5 end
+
+        for i, f in ipairs(config.farms) do
+            local rowTop = listTop + (i - 1) * rowH
+            local rowBot = rowTop + rowH - 1
+            if rowBot > listBottom then break end
+
+            -- Name (left, vertically centered)
+            local nameY = rowTop + math.floor((rowH - 1) / 2)
+            local nm = f.name
+            local maxNameLen = w - btnW - 4
+            if #nm > maxNameLen then nm = nm:sub(1, maxNameLen - 1) .. "." end
+            mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white)
+            mon.setCursorPos(2, nameY); mon.write(nm)
+
+            -- Status pill on right
+            local btnX2 = w - 1
+            local btnX1 = btnX2 - btnW + 1
+            local btnY1 = rowTop
+            local btnY2 = rowBot
+            if rowH > 1 then
+                btnY1 = rowTop
+                btnY2 = rowBot
+            end
+            local label = f.enabled and "ON" or "OFF"
+            local bg = f.enabled and colors.lime or colors.gray
+            local fg = f.enabled and colors.black or colors.white
+            drawBtn(mon, btnX1, btnY1, btnX2, btnY2, label, bg, fg, "toggle_" .. f.id)
+        end
+    end
+
+    -- Footer settings button
+    drawBtn(mon, 2, h - 1, w - 1, h, "[ SETTINGS ]", colors.gray, colors.white, "go_settings")
+end
+
+-- ============================================ SETTINGS SCREEN ============================================
+
+local function drawSettings()
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 16, 8)
+    mon.setBackgroundColor(colors.black); mon.clear()
+
+    drawHeader(mon, w, "SETTINGS", colors.purple)
+
+    -- Monitor row
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(2, 3); mon.write("Monitor:")
+    mon.setTextColor(colors.white)
+    local mn = config.monitor or "(this one)"
+    if #mn > w - 4 then mn = mn:sub(1, w - 5) .. "." end
+    mon.setCursorPos(2, 4); mon.write(mn)
+
+    mon.setTextColor(colors.gray)
+    mon.setCursorPos(2, 5); mon.write(string.rep("-", w - 2))
+
+    -- Farms list
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(2, 6); mon.write("Farms (" .. #config.farms .. "):")
+
+    local listTop = 7
+    local listBottom = h - 3
+
+    if #config.farms == 0 then
+        mon.setTextColor(colors.gray)
+        mon.setCursorPos(2, listTop + 1); mon.write("(none)")
+    else
+        local y = listTop
+        for _, f in ipairs(config.farms) do
+            if y > listBottom then break end
+            local nm = f.name
+            if #nm > w - 8 then nm = nm:sub(1, w - 9) .. "." end
+            mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white)
+            mon.setCursorPos(2, y); mon.write(nm)
+            -- Delete button
+            drawBtn(mon, w - 5, y, w - 1, y, "[DEL]", colors.red, colors.white, "del_" .. f.id)
+            y = y + 1
+        end
+    end
+
+    -- Add farm button + back
+    drawBtn(mon, 2, h - 2, w - 1, h - 2, "[ + ADD FARM ]", colors.green, colors.white, "add_farm")
+    drawBtn(mon, 2, h, w - 1, h, "[ < BACK ]", colors.gray, colors.white, "back")
+end
+
+-- ============================================ ADD FARM WIZARD ============================================
+
+local PAD_KEYS_TEXT = {
+    {"Q","W","E","R","T","Y","U","I","O","P"},
+    {"A","S","D","F","G","H","J","K","L","_"},
+    {"Z","X","C","V","B","N","M","-","<","OK"},
+}
+-- "<" = backspace (one char), "OK" = submit (two chars wide ideally)
+
+local function drawAddName()
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 22, 10)
+    mon.setBackgroundColor(colors.black); mon.clear()
+    drawHeader(mon, w, "FARM NAME", colors.green)
+
+    -- Display field
+    mon.setBackgroundColor(colors.gray); mon.setTextColor(colors.yellow)
+    local field = " " .. addBuf .. string.rep(" ", w - #addBuf - 3) .. " "
+    mon.setCursorPos(2, 3); mon.write(field)
+
+    mon.setTextColor(colors.gray); mon.setBackgroundColor(colors.black)
+    centerText(mon, w, 4, "Tap letters then OK", colors.gray)
+
+    -- Keyboard area: starts y=5
+    local kbTop = 5
+    local kbBot = h - 2
+    local kbH = kbBot - kbTop + 1
+    local rows = #PAD_KEYS_TEXT
+    local rowH = math.max(1, math.floor((kbH - (rows - 1)) / rows))
+    if rowH * rows + (rows - 1) > kbH then rowH = 1 end
+
+    local cols = 10
+    local btnW = math.max(2, math.floor((w - 2 - (cols - 1)) / cols))
+    if btnW < 2 then btnW = 2 end
+    local gridW = btnW * cols + (cols - 1)
+    local startX = math.floor((w - gridW) / 2) + 1
+    if startX < 2 then startX = 2 end
+
+    for r = 1, rows do
+        for c = 1, cols do
+            local ch = PAD_KEYS_TEXT[r][c]
+            local x1 = startX + (c - 1) * (btnW + 1)
+            local y1 = kbTop + (r - 1) * (rowH + 1)
+            local x2 = x1 + btnW - 1
+            local y2 = y1 + rowH - 1
+            if y2 > kbBot then break end
+            local bg, fg = colors.lightGray, colors.black
+            if ch == "OK" then bg, fg = colors.green, colors.white
+            elseif ch == "<" then bg, fg = colors.red, colors.white end
+            local label = ch
+            if #label > btnW then label = label:sub(1, btnW) end
+            drawBtn(mon, x1, y1, x2, y2, label, bg, fg, "kb_" .. r .. "_" .. c)
+        end
+    end
+
+    drawBtn(mon, 2, h, 11, h, "[CANCEL]", colors.gray, colors.white, "cancel")
+end
+
+local function drawAddRelay()
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 16, 8)
+    mon.setBackgroundColor(colors.black); mon.clear()
+    drawHeader(mon, w, "PICK RELAY", colors.green)
+
+    local relays = listByType("redstone_relay")
+    if #relays == 0 then
+        mon.setTextColor(colors.red)
+        centerText(mon, w, math.floor(h / 2), "No relays found!", colors.red)
+        centerText(mon, w, math.floor(h / 2) + 1, "Connect via wired", colors.gray)
+        centerText(mon, w, math.floor(h / 2) + 2, "modem network", colors.gray)
+    else
+        local y = 3
+        for i, n in ipairs(relays) do
+            if y > h - 2 then break end
+            local nm = n
+            if #nm > w - 4 then nm = nm:sub(1, w - 5) .. "." end
+            drawBtn(mon, 2, y, w - 1, y, " " .. nm, colors.gray, colors.white, "relay_" .. i)
+            y = y + 1
+        end
+    end
+
+    drawBtn(mon, 2, h, 11, h, "[CANCEL]", colors.gray, colors.white, "cancel")
+end
+
+local function drawAddSide()
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 16, 10)
+    mon.setBackgroundColor(colors.black); mon.clear()
+    drawHeader(mon, w, "PICK SIDE", colors.green)
+
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(2, 3); mon.write("Relay: " .. (addDraft.relay or ""))
+
+    local y = 5
+    for i, s in ipairs(SIDES) do
+        if y > h - 2 then break end
+        drawBtn(mon, 2, y, w - 1, y, " " .. s, colors.gray, colors.white, "side_" .. s)
+        y = y + 1
+    end
+
+    drawBtn(mon, 2, h, 11, h, "[CANCEL]", colors.gray, colors.white, "cancel")
+end
+
+-- ============================================ DRAW DISPATCH ============================================
+
+local function drawCurrent()
+    if screen == "main" then drawMain()
+    elseif screen == "settings" then drawSettings()
+    elseif screen == "add_name" then drawAddName()
+    elseif screen == "add_relay" then drawAddRelay()
+    elseif screen == "add_side" then drawAddSide()
+    end
+end
+
+-- ============================================ TOUCH HANDLING ============================================
+
+local function findClicked(x, y)
+    if not layoutCache then return nil end
+    for action, r in pairs(layoutCache) do
+        if x >= r.x1 and x <= r.x2 and y >= r.y1 and y <= r.y2 then return action end
+    end
+    return nil
+end
+
+local function handleAction(action)
+    -- Universal cancel
+    if action == "cancel" then
+        addDraft = nil; addBuf = ""
+        screen = "settings"
+        drawCurrent()
+        return
+    end
+
+    if screen == "main" then
+        if action == "go_settings" then screen = "settings"; drawCurrent(); return end
+        if action:sub(1, 7) == "toggle_" then
+            local id = action:sub(8)
+            toggleFarm(id)
+            drawCurrent()
+            return
+        end
+
+    elseif screen == "settings" then
+        if action == "back" then screen = "main"; drawCurrent(); return end
+        if action == "add_farm" then
+            addDraft = {}; addBuf = ""; screen = "add_name"; drawCurrent(); return
+        end
+        if action:sub(1, 4) == "del_" then
+            local id = action:sub(5)
+            -- Remove and stop the relay (turn farm off in inverted = relay HIGH)
+            for i, f in ipairs(config.farms) do
+                if f.id == id then
+                    f.enabled = false; applyFarm(f)
+                    table.remove(config.farms, i)
+                    break
+                end
+            end
+            saveConfig()
+            drawCurrent()
+            return
+        end
+
+    elseif screen == "add_name" then
+        if action:sub(1, 3) == "kb_" then
+            local r, c = action:match("kb_(%d+)_(%d+)")
+            r, c = tonumber(r), tonumber(c)
+            local ch = PAD_KEYS_TEXT[r][c]
+            if ch == "OK" then
+                if #addBuf == 0 then return end
+                addDraft.name = addBuf
+                addBuf = ""
+                screen = "add_relay"; drawCurrent()
+            elseif ch == "<" then
+                if #addBuf > 0 then addBuf = addBuf:sub(1, -2); drawCurrent() end
+            else
+                if #addBuf < 16 then addBuf = addBuf .. ch; drawCurrent() end
+            end
+            return
+        end
+
+    elseif screen == "add_relay" then
+        if action:sub(1, 6) == "relay_" then
+            local i = tonumber(action:sub(7))
+            local relays = listByType("redstone_relay")
+            if relays[i] then
+                addDraft.relay = relays[i]
+                screen = "add_side"; drawCurrent()
+            end
+            return
+        end
+
+    elseif screen == "add_side" then
+        if action:sub(1, 5) == "side_" then
+            local s = action:sub(6)
+            addDraft.relaySide = s
+            -- Save the new farm
+            local farm = {
+                id = genId(),
+                name = addDraft.name,
+                relay = addDraft.relay,
+                relaySide = addDraft.relaySide,
+                enabled = false,  -- Start disabled (relay HIGH = farm OFF in inverted logic)
+            }
+            table.insert(config.farms, farm)
+            applyFarm(farm)
+            saveConfig()
+            addDraft = nil; addBuf = ""
+            screen = "settings"; drawCurrent()
+            return
+        end
+    end
+end
+
+-- ============================================ INITIAL MONITOR PICKER (CONSOLE) ============================================
+
+local function pickMonitor()
+    local mons = listByType("monitor")
+    if #mons == 0 then
+        print("No monitors detected.")
+        print("Connect a monitor and reboot.")
+        while true do sleep(5) end
+    end
+
+    if #mons == 1 then
+        config.monitor = mons[1]
+        saveConfig()
+        return
+    end
+
+    print("=== CONTROLLER ===")
+    print("Multiple monitors found:")
+    for i, n in ipairs(mons) do
+        print("  " .. i .. ". " .. n)
+    end
+    while true do
+        write("Select 1-" .. #mons .. ": ")
+        local line = read()
+        local n = tonumber(line)
+        if n and mons[n] then
+            config.monitor = mons[n]
+            saveConfig()
+            return
+        end
+    end
+end
+
+-- ============================================ MAIN LOOP ============================================
+
+local function showConsoleSummary()
+    term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
+    term.setTextColor(colors.cyan); print("=== CONTROLLER v1.0 ===")
+    term.setTextColor(colors.white)
+    print("Monitor: " .. (config.monitor or "?"))
+    print("Farms:   " .. #config.farms)
+    if #config.farms > 0 then
+        print("")
+        for _, f in ipairs(config.farms) do
+            local st = f.enabled and "ON" or "OFF"
+            term.setTextColor(f.enabled and colors.lime or colors.gray)
+            print(("  [%s] %s (%s/%s)"):format(st, f.name, f.relay, f.relaySide))
+        end
+    end
+    term.setTextColor(colors.gray); print("")
+    print("Use the touch monitor to manage farms.")
+    print("[R] reboot   [W] wipe state")
+end
+
+local function consoleLoop()
+    showConsoleSummary()
+    while true do
+        local ev = { os.pullEvent() }
+        if ev[1] == "key" then
+            local k = ev[2]
+            if k == keys.r then os.reboot()
+            elseif k == keys.w then
+                term.setTextColor(colors.red); print("Type YES to wipe:")
+                if read() == "YES" then
+                    fs.delete("farms.dat")
+                    print("Wiped. Rebooting..."); sleep(1); os.reboot()
+                else
+                    showConsoleSummary()
+                end
+            end
+        elseif ev[1] == "term_resize" then
+            showConsoleSummary()
+        end
+    end
+end
+
+local function monitorLoop()
+    drawCurrent()
+    while true do
+        local ev = { os.pullEvent() }
+        if ev[1] == "monitor_touch" then
+            local n, x, y = ev[2], ev[3], ev[4]
+            if n == config.monitor then
+                local action = findClicked(x, y)
+                if action then handleAction(action) end
+            end
+        elseif ev[1] == "peripheral" then
+            -- New peripheral attached: redraw in case it was our monitor reconnecting
+            drawCurrent()
+        elseif ev[1] == "peripheral_detach" then
+            -- Monitor unplugged or relay gone - nothing to do; will recover on next draw
+        elseif ev[1] == "monitor_resize" then
+            drawCurrent()
+        end
+    end
+end
+
+-- ============================================ STARTUP ============================================
+
+loadConfig()
+
+if not config.monitor or not peripheral.wrap(config.monitor) then
+    pickMonitor()
+end
+
+-- Apply current state to all relays so reboot doesn't leave farms in random state.
+-- Note: by inverted logic, "enabled=false" means relay HIGH = farm physically off.
+applyAllFarms()
+
+parallel.waitForAny(monitorLoop, consoleLoop)
