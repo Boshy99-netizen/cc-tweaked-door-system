@@ -1,5 +1,5 @@
 -- ============================================
--- FARM CONTROLLER v1.0
+-- STRESS CONTROL v1.2
 -- Standalone program for toggling farms via inverted redstone relays.
 -- Relay HIGH = farm OFF (powered = stops the contraption)
 -- Relay LOW  = farm ON  (no signal = farm runs)
@@ -1323,7 +1323,7 @@ end
 
 local function showConsoleSummary()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
-    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.1 ===")
+    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.2 ===")
     term.setTextColor(colors.white)
     print("Control: " .. (config.controlMonitor or "?"))
     print("Stress:  " .. (config.stressMonitor or "(none)"))
