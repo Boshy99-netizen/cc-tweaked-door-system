@@ -1,9 +1,41 @@
 -- ============================================
--- STRESS CONTROL v1.2
+-- STRESS CONTROL v1.3
 -- Standalone program for toggling farms via inverted redstone relays.
 -- Relay HIGH = farm OFF (powered = stops the contraption)
 -- Relay LOW  = farm ON  (no signal = farm runs)
 -- ============================================
+
+-- ============================================ BUFFERED DRAW (must be FIRST) ============================================
+-- Window-based double buffering to eliminate flicker.
+-- Declared at top of file so all later code can call these without forward-declaration issues.
+
+local monWindows = {}  -- monitor name -> {win}
+
+local function getBuffer(mon, monName)
+    if not monName then return mon end
+    local w, h = mon.getSize()
+    local cached = monWindows[monName]
+    if cached and cached.win then
+        local cw, ch = cached.win.getSize()
+        if cw == w and ch == h then return cached.win end
+    end
+    local ok, win = pcall(window.create, mon, 1, 1, w, h, false)
+    if not ok or not win then
+        monWindows[monName] = nil
+        return mon
+    end
+    monWindows[monName] = { win = win }
+    return win
+end
+
+local function flushAllMonitors()
+    for _, entry in pairs(monWindows) do
+        if entry.win then
+            entry.win.setVisible(true)
+            entry.win.setVisible(false)
+        end
+    end
+end
 
 -- ============================================ STATE ============================================
 
@@ -219,53 +251,6 @@ local function toggleFarm(id)
 end
 
 -- ============================================ MONITOR HELPERS ============================================
-
--- ============================================ BUFFERED DRAW ============================================
--- Eliminates flicker by drawing to an invisible window, then making it visible
--- once the frame is complete. Falls back to direct draw if window API unsupported.
-
-local monWindows = {}  -- monitor name -> {win}
-
-local function getBuffer(mon, monName)
-    if not monName then return mon end
-    local w, h = mon.getSize()
-    local cached = monWindows[monName]
-    if cached and cached.win then
-        local cw, ch = cached.win.getSize()
-        if cw == w and ch == h then return cached.win end
-    end
-    local ok, win = pcall(window.create, mon, 1, 1, w, h, false)
-    if not ok or not win then
-        monWindows[monName] = nil
-        return mon
-    end
-    monWindows[monName] = { win = win }
-    return win
-end
-
-local function flushBuffer(monNameOrWin)
-    local cached
-    if type(monNameOrWin) == "string" then
-        cached = monWindows[monNameOrWin]
-    else
-        for _, entry in pairs(monWindows) do
-            if entry.win == monNameOrWin then cached = entry; break end
-        end
-    end
-    if cached and cached.win then
-        cached.win.setVisible(true)
-        cached.win.setVisible(false)
-    end
-end
-
-local function flushAllMonitors()
-    for _, entry in pairs(monWindows) do
-        if entry.win then
-            entry.win.setVisible(true)
-            entry.win.setVisible(false)
-        end
-    end
-end
 
 local function getControlMon()
     if not config.controlMonitor then return nil end
@@ -1323,7 +1308,7 @@ end
 
 local function showConsoleSummary()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
-    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.2 ===")
+    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.3 ===")
     term.setTextColor(colors.white)
     print("Control: " .. (config.controlMonitor or "?"))
     print("Stress:  " .. (config.stressMonitor or "(none)"))
