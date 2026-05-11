@@ -10,19 +10,24 @@
 local config = {
     controlMonitor = nil,    -- main UI: farm list + settings
     stressMonitor  = nil,    -- big stress display
-    animMonitor    = nil,    -- decorative animation
+    animMonitor    = nil,    -- now: vaults fill-level display
     farms          = {},     -- {id, name, relay, relaySide, enabled}
+    vaults         = {},     -- {id, name, peripheral}
 }
 
-local screen = "main"  -- main, settings, add_name, add_relay, add_side, pick_monitor
+local screen = "main"  -- main, settings, add_name, add_relay, add_side, pick_monitor, vaults, add_vault_name, add_vault_peri
 local addBuf = ""
 local addDraft = nil
 local prevHash = nil
 local layoutCache = nil
-local pickerTarget = nil  -- "control" | "stress" | "anim" while in pick_monitor screen
+local pickerTarget = nil  -- "control" | "stress" | "anim"
+local addKind = nil       -- "farm" | "vault" - which wizard the keyboard is for
 
 -- Stressometer (Create mod)
 local stressData = nil  -- {current, capacity, name} or nil
+
+-- Vault data: id -> {pct, slotsUsed, slotsTotal, valid, name}
+local vaultData = {}
 
 local function readStress()
     local stressTypes = { "Create_Stressometer", "create:stressometer", "stressometer" }
@@ -78,7 +83,92 @@ end
 
 local SIDES = { "top", "bottom", "left", "right", "front", "back" }
 
--- ============================================ PERSISTENCE ============================================
+-- ============================================ VAULTS ============================================
+
+local function genVaultId()
+    local i = 1
+    while true do
+        local exists = false
+        for _, v in ipairs(config.vaults) do
+            if v.id == "vault_" .. i then exists = true; break end
+        end
+        if not exists then return "vault_" .. i end
+        i = i + 1
+    end
+end
+
+-- Lists peripherals that look like inventories (have list + size methods).
+-- Returns array of names.
+local function listInventoryPeripherals()
+    local r = {}
+    for _, n in ipairs(peripheral.getNames()) do
+        local p = peripheral.wrap(n)
+        if p and type(p.list) == "function" and type(p.size) == "function" then
+            table.insert(r, n)
+        end
+    end
+    table.sort(r)
+    return r
+end
+
+local function readOneVault(v)
+    local p = peripheral.wrap(v.peripheral)
+    if not p or type(p.list) ~= "function" or type(p.size) ~= "function" then
+        return { valid = false, pct = 0, slotsUsed = 0, slotsTotal = 0, name = v.name }
+    end
+    local okS, size = pcall(p.size)
+    if not okS or type(size) ~= "number" or size <= 0 then
+        return { valid = false, pct = 0, slotsUsed = 0, slotsTotal = 0, name = v.name }
+    end
+    local okL, items = pcall(p.list)
+    if not okL or type(items) ~= "table" then
+        return { valid = false, pct = 0, slotsUsed = 0, slotsTotal = size, name = v.name }
+    end
+
+    -- Fill ratio = sum(item.count) / sum(slot limits).
+    -- For occupied slots ask getItemLimit; for empty assume 64 (cheap default).
+    local hasLimit = type(p.getItemLimit) == "function"
+    local totalCount = 0
+    local totalCapacity = 0
+    local used = 0
+    for slot, item in pairs(items) do
+        used = used + 1
+        local cnt = (type(item) == "table" and item.count) or 0
+        totalCount = totalCount + cnt
+        local lim = 64
+        if hasLimit then
+            local ok, l = pcall(p.getItemLimit, slot)
+            if ok and type(l) == "number" and l > 0 then lim = l end
+        end
+        totalCapacity = totalCapacity + lim
+    end
+    -- Empty slots contribute 64-each (typical max stack)
+    local emptySlots = size - used
+    totalCapacity = totalCapacity + emptySlots * 64
+
+    local pct = 0
+    if totalCapacity > 0 then
+        pct = totalCount / totalCapacity * 100
+    end
+    if pct < 0 then pct = 0 end
+    if pct > 100 then pct = 100 end
+
+    return {
+        valid = true,
+        pct = pct,
+        slotsUsed = used,
+        slotsTotal = size,
+        name = v.name,
+    }
+end
+
+local function readAllVaults()
+    local newData = {}
+    for _, v in ipairs(config.vaults) do
+        newData[v.id] = readOneVault(v)
+    end
+    vaultData = newData
+end
 
 local function saveConfig()
     local ok, txt = pcall(textutils.serialize, config)
@@ -93,11 +183,11 @@ local function loadConfig()
     local txt = f.readAll(); f.close()
     local ok, decoded = pcall(textutils.unserialize, txt)
     if not ok or type(decoded) ~= "table" then return false end
-    -- Migrate old single-monitor field if present
     config.controlMonitor = decoded.controlMonitor or decoded.monitor
     config.stressMonitor  = decoded.stressMonitor
     config.animMonitor    = decoded.animMonitor
     config.farms          = decoded.farms or {}
+    config.vaults         = decoded.vaults or {}
     return true
 end
 
@@ -332,86 +422,143 @@ local function drawStressMonitor()
     end
 end
 
--- ============================================ ANIMATION MONITOR (Matrix rain) ============================================
+-- ============================================ VAULTS MONITOR ============================================
+-- Renders each vault as a fill-level box with name underneath and % inside.
+-- Grid auto-fits to monitor size.
 
-local matrixState = nil  -- {cols={[col]={head=y, length=L, chars=[]}}, w, h, charset}
-
-local function initMatrix(w, h)
-    matrixState = { w = w, h = h, cols = {} }
-    -- Use ASCII printable characters (Code Page 437 / CC-friendly subset)
-    matrixState.charset = "01@#$%&*+=<>{}[]/\\|abcdefghijklmnopqrstuvwxyz0123456789"
-    for c = 1, w do
-        matrixState.cols[c] = nil  -- no drop active in this column initially
-    end
+local function vaultColor(pct)
+    if pct >= 99   then return colors.red end
+    if pct >= 85   then return colors.orange end
+    if pct >= 60   then return colors.yellow end
+    if pct >  0    then return colors.lime end
+    return colors.gray
 end
 
-local function randomChar()
-    if not matrixState then return "0" end
-    local cs = matrixState.charset
-    local i = math.random(1, #cs)
-    return cs:sub(i, i)
-end
+local function drawVaultsMonitor()
+    local mon = getAnimMon(); if not mon then return end
+    local _, w, h = autoScale(mon, 16, 10)
+    mon.setBackgroundColor(colors.black); mon.clear()
 
-local function tickMatrix(mon, w, h)
-    if not matrixState or matrixState.w ~= w or matrixState.h ~= h then
-        initMatrix(w, h)
-        mon.setBackgroundColor(colors.black); mon.clear()
+    -- Title
+    mon.setBackgroundColor(colors.cyan); mon.setTextColor(colors.black)
+    for x = 1, w do mon.setCursorPos(x, 1); mon.write(" ") end
+    local title = "VAULTS"
+    mon.setCursorPos(math.floor((w - #title) / 2) + 1, 1); mon.write(title)
+    mon.setBackgroundColor(colors.black)
+
+    local list = vaultData
+    -- Build ordered list using config.vaults to keep stable order
+    local ordered = {}
+    for _, v in ipairs(config.vaults) do
+        if list[v.id] then table.insert(ordered, list[v.id]) end
     end
 
-    -- Process each column: advance existing drops, possibly start new ones
-    for c = 1, w do
-        local drop = matrixState.cols[c]
-        if drop then
-            drop.head = drop.head + 1
-            -- Add a new char at the new head
-            if drop.head <= h then
-                drop.chars[drop.head] = randomChar()
-            end
-            -- The "tail" position 'length' steps back disappears
-            local clearY = drop.head - drop.length
-            if clearY >= 1 and clearY <= h then
-                mon.setCursorPos(c, clearY)
-                mon.setBackgroundColor(colors.black)
-                mon.write(" ")
-            end
-            -- Once head goes past bottom by length+random, drop ends
-            if drop.head > h + drop.length then
-                matrixState.cols[c] = nil
-            else
-                -- Repaint trail with fading colors
-                for y = math.max(1, drop.head - drop.length + 1), math.min(h, drop.head) do
-                    local distFromHead = drop.head - y
-                    local color
-                    if distFromHead == 0      then color = colors.white
-                    elseif distFromHead == 1  then color = colors.lime
-                    elseif distFromHead <= 3  then color = colors.green
-                    elseif distFromHead <= drop.length - 2 then color = colors.gray
-                    else color = colors.black end
-                    if color ~= colors.black and drop.chars[y] then
-                        mon.setCursorPos(c, y)
-                        mon.setBackgroundColor(colors.black)
-                        mon.setTextColor(color)
-                        mon.write(drop.chars[y])
-                    end
-                end
-            end
+    if #ordered == 0 then
+        mon.setTextColor(colors.gray)
+        local m1 = "No vaults configured"
+        local m2 = "Add via Settings"
+        mon.setCursorPos(math.floor((w - #m1) / 2) + 1, math.floor(h / 2));     mon.write(m1)
+        mon.setCursorPos(math.floor((w - #m2) / 2) + 1, math.floor(h / 2) + 1); mon.write(m2)
+        return
+    end
+
+    -- Layout: rows of boxes. Box has body (variable rows) + 1 name row + 1 gap.
+    -- Pick a column count that gives readable boxes (min width 6 per box).
+    local areaTop, areaBot = 3, h
+    local areaH = areaBot - areaTop + 1
+
+    local n = #ordered
+    local minBoxW = 6
+    local cols = math.min(n, math.max(1, math.floor((w - 1) / (minBoxW + 1))))
+    local rows = math.ceil(n / cols)
+
+    local gapX = 1
+    local boxW = math.floor((w - 1 - gapX * (cols - 1)) / cols)
+    if boxW < minBoxW then boxW = minBoxW end
+
+    local gapY = 1
+    local nameRows = 1
+    local rowH = math.floor((areaH - gapY * (rows - 1)) / rows)
+    local bodyH = rowH - nameRows
+    if bodyH < 3 then bodyH = 3; rowH = bodyH + nameRows end
+
+    -- Center the grid horizontally
+    local gridW = boxW * cols + gapX * (cols - 1)
+    local startX = math.max(1, math.floor((w - gridW) / 2) + 1)
+
+    for i, vd in ipairs(ordered) do
+        local rIdx = math.floor((i - 1) / cols)
+        local cIdx = (i - 1) % cols
+        local boxX1 = startX + cIdx * (boxW + gapX)
+        local boxX2 = boxX1 + boxW - 1
+        local boxY1 = areaTop + rIdx * (rowH + gapY)
+        local boxY2 = boxY1 + bodyH - 1
+        if boxY2 > h - 1 then break end
+
+        local color = vaultColor(vd.pct)
+        if not vd.valid then color = colors.gray end
+
+        -- Compute fill height (bottom-up)
+        local innerH = bodyH
+        local pct = vd.pct
+        if pct < 0 then pct = 0 end
+        if pct > 100 then pct = 100 end
+        local fillRows = math.floor(innerH * pct / 100 + 0.5)
+        if vd.valid and pct > 0 and fillRows == 0 then fillRows = 1 end
+
+        -- Draw box: empty top portion, filled bottom portion
+        local emptyTopRows = innerH - fillRows
+        for r = 0, emptyTopRows - 1 do
+            mon.setCursorPos(boxX1, boxY1 + r)
+            mon.setBackgroundColor(colors.gray)
+            mon.write(string.rep(" ", boxW))
+        end
+        for r = emptyTopRows, innerH - 1 do
+            mon.setCursorPos(boxX1, boxY1 + r)
+            mon.setBackgroundColor(color)
+            mon.write(string.rep(" ", boxW))
+        end
+
+        -- Border (thin frame on top + corners with brackets)
+        mon.setBackgroundColor(colors.black)
+        mon.setTextColor(colors.lightGray)
+        -- We don't draw an explicit border so the box looks like a solid pill;
+        -- but mark the top edge with darker tick to imply lid
+        -- (skip for now to keep clean look)
+
+        -- Percent text centered inside (try to keep readable contrast)
+        local pctStr
+        if vd.valid then
+            pctStr = string.format("%d%%", math.floor(pct + 0.5))
         else
-            -- Random chance to spawn a new drop in this column
-            if math.random(1, 18) == 1 then
-                matrixState.cols[c] = {
-                    head = 0,
-                    length = math.random(4, math.max(5, math.floor(h * 0.7))),
-                    chars = {},
-                }
-            end
+            pctStr = "?"
+        end
+        local cx = boxX1 + math.floor((boxW - #pctStr) / 2)
+        local cy = boxY1 + math.floor(innerH / 2)
+        -- Determine bg under text and pick contrasting fg
+        local rowFromBottom = boxY1 + innerH - 1 - cy
+        local textOverFill = rowFromBottom < fillRows
+        local bgUnder = textOverFill and color or colors.gray
+        local fgText = colors.black
+        -- Yellow/lime/gray are fine with black; red/orange need white for readability
+        if bgUnder == colors.red or bgUnder == colors.orange then fgText = colors.white end
+        if bgUnder == colors.gray then fgText = colors.white end
+        mon.setCursorPos(cx, cy)
+        mon.setBackgroundColor(bgUnder)
+        mon.setTextColor(fgText)
+        mon.write(pctStr)
+        mon.setBackgroundColor(colors.black)
+
+        -- Name underneath
+        local nameY = boxY2 + 1
+        if nameY <= h then
+            local nm = vd.name or ""
+            if #nm > boxW then nm = nm:sub(1, boxW) end
+            local nx = boxX1 + math.floor((boxW - #nm) / 2)
+            if not vd.valid then mon.setTextColor(colors.red) else mon.setTextColor(colors.white) end
+            mon.setCursorPos(nx, nameY); mon.write(nm)
         end
     end
-end
-
-local function drawAnimMonitor()
-    local mon = getAnimMon(); if not mon then return end
-    local _, w, h = autoScale(mon, 12, 8)
-    tickMatrix(mon, w, h)
 end
 
 -- ============================================ SETTINGS SCREEN ============================================
@@ -466,6 +613,7 @@ local function drawSettings()
     end
 
     drawBtn(mon, 2, h - 2, w - 1, h - 2, "[ + ADD FARM ]", colors.green, colors.white, "add_farm")
+    drawBtn(mon, 2, h - 1, w - 1, h - 1, "[ VAULTS ]",     colors.cyan,  colors.black, "go_vaults")
     drawBtn(mon, 2, h, w - 1, h, "[ < BACK ]", colors.gray, colors.white, "back")
 end
 
@@ -652,6 +800,144 @@ end
 
 -- ============================================ DRAW DISPATCH ============================================
 
+-- ============================================ VAULTS MANAGEMENT SCREEN ============================================
+
+local function drawVaults()
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 22, 10)
+    mon.setBackgroundColor(colors.black); mon.clear()
+    drawHeader(mon, w, "VAULTS", colors.cyan)
+
+    -- Status of anim monitor (where vaults are displayed)
+    mon.setBackgroundColor(colors.black); mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(2, 3); mon.write("Display:")
+    mon.setTextColor(config.animMonitor and colors.white or colors.gray)
+    local d = config.animMonitor or "(set Anim mon)"
+    if #d > w - 11 then d = d:sub(1, w - 12) .. "." end
+    mon.setCursorPos(11, 3); mon.write(d)
+
+    mon.setTextColor(colors.gray)
+    mon.setCursorPos(2, 4); mon.write(string.rep("-", w - 2))
+
+    mon.setTextColor(colors.lightGray)
+    mon.setCursorPos(2, 5); mon.write("Configured (" .. #config.vaults .. "):")
+
+    local y = 6
+    local listBottom = h - 3
+    if #config.vaults == 0 then
+        mon.setTextColor(colors.gray)
+        mon.setCursorPos(2, y); mon.write("(none)")
+    else
+        for _, v in ipairs(config.vaults) do
+            if y > listBottom then break end
+            local nm = v.name
+            if #nm > w - 8 then nm = nm:sub(1, w - 9) .. "." end
+            mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white)
+            mon.setCursorPos(2, y); mon.write(nm)
+            -- Subtle current % indicator
+            local vd = vaultData[v.id]
+            if vd and vd.valid then
+                local pctStr = string.format("%d%%", math.floor(vd.pct + 0.5))
+                mon.setTextColor(vaultColor(vd.pct))
+                mon.setCursorPos(w - 11, y); mon.write(pctStr)
+            end
+            drawBtn(mon, w - 5, y, w - 1, y, "[DEL]", colors.red, colors.white, "delv_" .. v.id)
+            y = y + 1
+        end
+    end
+
+    drawBtn(mon, 2, h - 2, w - 1, h - 2, "[ + ADD VAULT ]", colors.green, colors.white, "add_vault")
+    drawBtn(mon, 2, h, w - 1, h, "[ < BACK ]", colors.gray, colors.white, "back")
+end
+
+local function drawAddVaultName()
+    -- Same look as drawAddName but title differs and submit goes to vault peripheral pick.
+    -- We reuse the keyboard renderer via a shared helper, but to keep the diff small
+    -- we render with our own title and reuse the same KB_ROWS state.
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 40, 12)
+    mon.setBackgroundColor(colors.black); mon.clear()
+    drawHeader(mon, w, "VAULT NAME", colors.green)
+
+    mon.setBackgroundColor(colors.gray); mon.setTextColor(colors.yellow)
+    local shown = addBuf
+    if #shown > w - 4 then shown = shown:sub(-(w - 4)) end
+    local field = " " .. shown .. string.rep(" ", w - #shown - 3) .. " "
+    mon.setCursorPos(2, 3); mon.write(field)
+
+    mon.setTextColor(colors.gray); mon.setBackgroundColor(colors.black)
+    centerText(mon, w, 4, "Tap letters then OK", colors.gray)
+
+    local kbTop = 5
+    local kbBot = h - 2
+    local kbH = kbBot - kbTop + 1
+    local rows = #KB_ROWS
+    local rowH = 2
+    if rowH * rows + (rows - 1) > kbH then rowH = 1 end
+
+    local cols = 10
+    local btnW = math.max(3, math.floor((w - 2 - (cols - 1)) / cols))
+    local gridW = btnW * cols + (cols - 1)
+    local startX = math.floor((w - gridW) / 2) + 1
+    if startX < 2 then startX = 2 end
+
+    for r = 1, rows do
+        for c = 1, cols do
+            local raw = KB_ROWS[r][c]
+            local x1 = startX + (c - 1) * (btnW + 1)
+            local y1 = kbTop + (r - 1) * (rowH + 1)
+            local x2 = x1 + btnW - 1
+            local y2 = y1 + rowH - 1
+            if y2 > kbBot then break end
+
+            local bg, fg = colors.lightGray, colors.black
+            if raw == "OK"  then bg, fg = colors.green, colors.white
+            elseif raw == "<"  then bg, fg = colors.red, colors.white
+            elseif raw == "Sh" then
+                if kbShift then bg, fg = colors.yellow, colors.black
+                else            bg, fg = colors.cyan,   colors.black end
+            elseif raw == "_" then bg, fg = colors.lightBlue, colors.black
+            elseif raw:match("^%d$") then bg, fg = colors.white, colors.black
+            end
+
+            local label = kbLabel(raw, kbShift)
+            if #label > btnW then label = label:sub(1, btnW) end
+            drawBtn(mon, x1, y1, x2, y2, label, bg, fg, "kb_" .. r .. "_" .. c)
+        end
+    end
+
+    drawBtn(mon, 2, h, 11, h, "[CANCEL]", colors.gray, colors.white, "cancel")
+end
+
+local function drawAddVaultPeri()
+    local mon = getMon(); if not mon then return end
+    layoutCache = {}
+    local _, w, h = autoScale(mon, 16, 8)
+    mon.setBackgroundColor(colors.black); mon.clear()
+    drawHeader(mon, w, "PICK VAULT", colors.green)
+
+    local invs = listInventoryPeripherals()
+    if #invs == 0 then
+        mon.setTextColor(colors.red)
+        centerText(mon, w, math.floor(h / 2),     "No inventories found!", colors.red)
+        centerText(mon, w, math.floor(h / 2) + 1, "Connect a Vault/chest", colors.gray)
+        centerText(mon, w, math.floor(h / 2) + 2, "via wired modem.",      colors.gray)
+    else
+        local y = 3
+        for i, n in ipairs(invs) do
+            if y > h - 2 then break end
+            local nm = n
+            if #nm > w - 4 then nm = nm:sub(1, w - 5) .. "." end
+            drawBtn(mon, 2, y, w - 1, y, " " .. nm, colors.gray, colors.white, "vperi_" .. i)
+            y = y + 1
+        end
+    end
+
+    drawBtn(mon, 2, h, 11, h, "[CANCEL]", colors.gray, colors.white, "cancel")
+end
+
 local function drawCurrent()
     if screen == "main" then drawMain()
     elseif screen == "settings" then drawSettings()
@@ -659,6 +945,9 @@ local function drawCurrent()
     elseif screen == "add_relay" then drawAddRelay()
     elseif screen == "add_side" then drawAddSide()
     elseif screen == "pick_monitor" then drawPickMonitor()
+    elseif screen == "vaults" then drawVaults()
+    elseif screen == "add_vault_name" then drawAddVaultName()
+    elseif screen == "add_vault_peri" then drawAddVaultPeri()
     end
 end
 
@@ -678,8 +967,11 @@ local function handleAction(action)
         if screen == "pick_monitor" then
             pickerTarget = nil
             screen = "settings"
+        elseif screen == "add_vault_name" or screen == "add_vault_peri" then
+            addDraft = nil; addBuf = ""; kbShift = false
+            screen = "vaults"
         else
-            addDraft = nil; addBuf = ""
+            addDraft = nil; addBuf = ""; kbShift = false
             screen = "settings"
         end
         drawCurrent()
@@ -703,6 +995,7 @@ local function handleAction(action)
         if action == "set_ctrl"   then pickerTarget = "control"; screen = "pick_monitor"; drawCurrent(); return end
         if action == "set_stress" then pickerTarget = "stress";  screen = "pick_monitor"; drawCurrent(); return end
         if action == "set_anim"   then pickerTarget = "anim";    screen = "pick_monitor"; drawCurrent(); return end
+        if action == "go_vaults"  then screen = "vaults"; drawCurrent(); return end
         if action:sub(1, 4) == "del_" then
             local id = action:sub(5)
             for i, f in ipairs(config.farms) do
@@ -721,17 +1014,13 @@ local function handleAction(action)
         local function setForTarget(value)
             if pickerTarget == "control" then config.controlMonitor = value
             elseif pickerTarget == "stress" then config.stressMonitor = value
-            elseif pickerTarget == "anim" then
-                config.animMonitor = value
-                matrixState = nil  -- reset animation
-                -- If we cleared anim monitor, blank it
-                if not value then
-                    -- Cannot blank a screen we no longer reference; previous monitor will simply stop being updated
-                end
+            elseif pickerTarget == "anim" then config.animMonitor = value
             end
             saveConfig()
-            -- Reset matrix state when anim changes
-            if pickerTarget == "anim" then matrixState = nil end
+            -- Force redraw of all 3 monitors after change
+            drawCurrent()
+            drawStressMonitor()
+            drawVaultsMonitor()
         end
 
         if action == "pick_none" then
@@ -802,6 +1091,67 @@ local function handleAction(action)
             saveConfig()
             addDraft = nil; addBuf = ""
             screen = "settings"; drawCurrent()
+            return
+        end
+
+    elseif screen == "vaults" then
+        if action == "back" then screen = "settings"; drawCurrent(); return end
+        if action == "add_vault" then
+            addDraft = {}; addBuf = ""; kbShift = false
+            screen = "add_vault_name"; drawCurrent(); return
+        end
+        if action:sub(1, 5) == "delv_" then
+            local id = action:sub(6)
+            for i, v in ipairs(config.vaults) do
+                if v.id == id then table.remove(config.vaults, i); break end
+            end
+            vaultData[id] = nil
+            saveConfig()
+            drawCurrent()
+            drawVaultsMonitor()
+            return
+        end
+
+    elseif screen == "add_vault_name" then
+        if action:sub(1, 3) == "kb_" then
+            local r, c = action:match("kb_(%d+)_(%d+)")
+            r, c = tonumber(r), tonumber(c)
+            local raw = KB_ROWS[r][c]
+            local token = kbInsert(raw, kbShift)
+            if token == "OK" then
+                if #addBuf == 0 then return end
+                addDraft.name = addBuf
+                addBuf = ""
+                kbShift = false
+                screen = "add_vault_peri"; drawCurrent()
+            elseif token == "<" then
+                if #addBuf > 0 then addBuf = addBuf:sub(1, -2); drawCurrent() end
+            elseif token == "Sh" then
+                kbShift = not kbShift; drawCurrent()
+            else
+                if #addBuf < 24 then addBuf = addBuf .. token; drawCurrent() end
+            end
+            return
+        end
+
+    elseif screen == "add_vault_peri" then
+        if action:sub(1, 6) == "vperi_" then
+            local i = tonumber(action:sub(7))
+            local invs = listInventoryPeripherals()
+            if invs[i] then
+                local vault = {
+                    id = genVaultId(),
+                    name = addDraft.name,
+                    peripheral = invs[i],
+                }
+                table.insert(config.vaults, vault)
+                saveConfig()
+                -- Immediately read its current fill so user sees it
+                vaultData[vault.id] = readOneVault(vault)
+                addDraft = nil; addBuf = ""
+                screen = "vaults"; drawCurrent()
+                drawVaultsMonitor()
+            end
             return
         end
     end
@@ -899,12 +1249,13 @@ end
 
 local function monitorLoop()
     readStress()
+    readAllVaults()
     drawCurrent()
     drawStressMonitor()
-    drawAnimMonitor()
+    drawVaultsMonitor()
 
     local stressTimer = os.startTimer(1)
-    local animTimer   = os.startTimer(0.2)  -- 5 fps
+    local vaultTimer  = os.startTimer(2)
 
     while true do
         local ev = { os.pullEvent() }
@@ -914,26 +1265,27 @@ local function monitorLoop()
                 local action = findClicked(x, y)
                 if action then handleAction(action) end
             end
-            -- Touches on stress/anim monitors are ignored
+            -- Touches on stress/vault monitors are ignored
 
         elseif ev[1] == "timer" then
             if ev[2] == stressTimer then
-                local prev = stressData
                 readStress()
-                -- Always redraw stress monitor (changes anyway)
                 drawStressMonitor()
                 stressTimer = os.startTimer(1)
-            elseif ev[2] == animTimer then
-                drawAnimMonitor()
-                animTimer = os.startTimer(0.2)
+            elseif ev[2] == vaultTimer then
+                readAllVaults()
+                drawVaultsMonitor()
+                -- Also refresh vaults list if we're on that screen, so % updates
+                if screen == "vaults" then drawCurrent() end
+                vaultTimer = os.startTimer(2)
             end
 
         elseif ev[1] == "peripheral" then
-            -- A peripheral attached: re-resolve stress and redraw all
             readStress()
+            readAllVaults()
             drawCurrent()
             drawStressMonitor()
-            drawAnimMonitor()
+            drawVaultsMonitor()
 
         elseif ev[1] == "peripheral_detach" then
             local n = ev[2]
@@ -941,15 +1293,19 @@ local function monitorLoop()
                 stressData = nil
                 drawStressMonitor()
             end
-            if n == config.animMonitor then
-                matrixState = nil
+            -- Any vault using this peripheral is now invalid; readAllVaults next tick will mark it
+            for _, v in ipairs(config.vaults) do
+                if v.peripheral == n then
+                    vaultData[v.id] = { valid = false, pct = 0, slotsUsed = 0, slotsTotal = 0, name = v.name }
+                end
             end
+            drawVaultsMonitor()
 
         elseif ev[1] == "monitor_resize" then
             local n = ev[2]
             if n == config.controlMonitor then drawCurrent()
             elseif n == config.stressMonitor then drawStressMonitor()
-            elseif n == config.animMonitor then matrixState = nil; drawAnimMonitor() end
+            elseif n == config.animMonitor then drawVaultsMonitor() end
         end
     end
 end
