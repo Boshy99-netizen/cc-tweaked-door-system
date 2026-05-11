@@ -220,6 +220,53 @@ end
 
 -- ============================================ MONITOR HELPERS ============================================
 
+-- ============================================ BUFFERED DRAW ============================================
+-- Eliminates flicker by drawing to an invisible window, then making it visible
+-- once the frame is complete. Falls back to direct draw if window API unsupported.
+
+local monWindows = {}  -- monitor name -> {win}
+
+local function getBuffer(mon, monName)
+    if not monName then return mon end
+    local w, h = mon.getSize()
+    local cached = monWindows[monName]
+    if cached and cached.win then
+        local cw, ch = cached.win.getSize()
+        if cw == w and ch == h then return cached.win end
+    end
+    local ok, win = pcall(window.create, mon, 1, 1, w, h, false)
+    if not ok or not win then
+        monWindows[monName] = nil
+        return mon
+    end
+    monWindows[monName] = { win = win }
+    return win
+end
+
+local function flushBuffer(monNameOrWin)
+    local cached
+    if type(monNameOrWin) == "string" then
+        cached = monWindows[monNameOrWin]
+    else
+        for _, entry in pairs(monWindows) do
+            if entry.win == monNameOrWin then cached = entry; break end
+        end
+    end
+    if cached and cached.win then
+        cached.win.setVisible(true)
+        cached.win.setVisible(false)
+    end
+end
+
+local function flushAllMonitors()
+    for _, entry in pairs(monWindows) do
+        if entry.win then
+            entry.win.setVisible(true)
+            entry.win.setVisible(false)
+        end
+    end
+end
+
 local function getControlMon()
     if not config.controlMonitor then return nil end
     local m = peripheral.wrap(config.controlMonitor)
@@ -314,54 +361,6 @@ local function autoScale(monOrName, minW, minH)
         end
     end
     return best.s, best.w, best.h
-end
-
--- ============================================ BUFFERED DRAW ============================================
--- Eliminates flicker by drawing to an invisible window, then making it visible
--- once the frame is complete. Falls back to direct draw if window API unsupported.
-
-local monWindows = {}  -- monitor name -> window
-
-local function getBuffer(mon, monName)
-    if not monName then return mon end
-    local w, h = mon.getSize()
-    local cached = monWindows[monName]
-    if cached and cached.win then
-        local cw, ch = cached.win.getSize()
-        if cw == w and ch == h then return cached.win end
-    end
-    -- Create new window
-    local ok, win = pcall(window.create, mon, 1, 1, w, h, false)
-    if not ok or not win then
-        monWindows[monName] = nil
-        return mon
-    end
-    monWindows[monName] = { win = win }
-    return win
-end
-
-local function flushBuffer(monNameOrWin)
-    local cached
-    if type(monNameOrWin) == "string" then
-        cached = monWindows[monNameOrWin]
-    else
-        for _, entry in pairs(monWindows) do
-            if entry.win == monNameOrWin then cached = entry; break end
-        end
-    end
-    if cached and cached.win then
-        cached.win.setVisible(true)
-        cached.win.setVisible(false)
-    end
-end
-
-local function flushAllMonitors()
-    for _, entry in pairs(monWindows) do
-        if entry.win then
-            entry.win.setVisible(true)
-            entry.win.setVisible(false)
-        end
-    end
 end
 
 local function drawHeader(mon, w, title, color)
