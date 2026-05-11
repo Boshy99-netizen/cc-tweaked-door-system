@@ -97,13 +97,22 @@ local function genVaultId()
     end
 end
 
--- Lists peripherals that look like inventories (have list + size methods).
--- Returns array of names.
+-- Lists peripherals that look like inventories. We avoid peripheral.wrap()
+-- on every device (slow on large Create vaults) and instead filter by type.
 local function listInventoryPeripherals()
     local r = {}
     for _, n in ipairs(peripheral.getNames()) do
-        local p = peripheral.wrap(n)
-        if p and type(p.list) == "function" and type(p.size) == "function" then
+        local t = peripheral.getType(n) or ""
+        -- Anything that's not a relay/modem/monitor/computer is likely an inventory
+        if t ~= "redstone_relay"
+           and t ~= "modem"
+           and t ~= "monitor"
+           and t ~= "computer"
+           and t ~= "speaker"
+           and t ~= "drive"
+           and t ~= "printer"
+           and not t:find("stressometer", 1, true)
+           and not t:find("speedometer", 1, true) then
             table.insert(r, n)
         end
     end
@@ -125,30 +134,22 @@ local function readOneVault(v)
         return { valid = false, pct = 0, slotsUsed = 0, slotsTotal = size, name = v.name }
     end
 
-    -- Fill ratio = sum(item.count) / sum(slot limits).
-    -- For occupied slots ask getItemLimit; for empty assume 64 (cheap default).
-    local hasLimit = type(p.getItemLimit) == "function"
+    -- Fast approximation: sum item.count, assume max stack 64 per slot.
+    -- Calling getItemLimit per slot is SLOW (blocks main thread for 100+ ms
+    -- on large Create vaults), so we don't do it here.
     local totalCount = 0
-    local totalCapacity = 0
     local used = 0
-    for slot, item in pairs(items) do
+    for _, item in pairs(items) do
         used = used + 1
-        local cnt = (type(item) == "table" and item.count) or 0
-        totalCount = totalCount + cnt
-        local lim = 64
-        if hasLimit then
-            local ok, l = pcall(p.getItemLimit, slot)
-            if ok and type(l) == "number" and l > 0 then lim = l end
+        if type(item) == "table" and type(item.count) == "number" then
+            totalCount = totalCount + item.count
         end
-        totalCapacity = totalCapacity + lim
     end
-    -- Empty slots contribute 64-each (typical max stack)
-    local emptySlots = size - used
-    totalCapacity = totalCapacity + emptySlots * 64
 
+    local maxPossible = size * 64
     local pct = 0
-    if totalCapacity > 0 then
-        pct = totalCount / totalCapacity * 100
+    if maxPossible > 0 then
+        pct = totalCount / maxPossible * 100
     end
     if pct < 0 then pct = 0 end
     if pct > 100 then pct = 100 end
@@ -1146,8 +1147,11 @@ local function handleAction(action)
                 }
                 table.insert(config.vaults, vault)
                 saveConfig()
-                -- Immediately read its current fill so user sees it
-                vaultData[vault.id] = readOneVault(vault)
+                -- Placeholder until background poller reads it on next cycle
+                vaultData[vault.id] = {
+                    valid = false, pct = 0, slotsUsed = 0,
+                    slotsTotal = 0, name = vault.name
+                }
                 addDraft = nil; addBuf = ""
                 screen = "vaults"; drawCurrent()
                 drawVaultsMonitor()
@@ -1247,15 +1251,31 @@ local function consoleLoop()
     end
 end
 
+-- Separate coroutine for vault polling so it doesn't block UI touches.
+-- Each vault is read with sleep between to yield to the scheduler.
+local function vaultPollLoop()
+    while true do
+        for _, v in ipairs(config.vaults) do
+            local ok, data = pcall(readOneVault, v)
+            if ok and data then
+                vaultData[v.id] = data
+            end
+            sleep(0)  -- yield between vaults
+        end
+        -- Redraw monitor + vaults list (if visible). These calls are quick.
+        local okD = pcall(drawVaultsMonitor)
+        if screen == "vaults" then pcall(drawCurrent) end
+        sleep(2)  -- between full polling rounds
+    end
+end
+
 local function monitorLoop()
     readStress()
-    readAllVaults()
     drawCurrent()
     drawStressMonitor()
     drawVaultsMonitor()
 
     local stressTimer = os.startTimer(1)
-    local vaultTimer  = os.startTimer(2)
 
     while true do
         local ev = { os.pullEvent() }
@@ -1265,27 +1285,19 @@ local function monitorLoop()
                 local action = findClicked(x, y)
                 if action then handleAction(action) end
             end
-            -- Touches on stress/vault monitors are ignored
 
         elseif ev[1] == "timer" then
             if ev[2] == stressTimer then
                 readStress()
                 drawStressMonitor()
                 stressTimer = os.startTimer(1)
-            elseif ev[2] == vaultTimer then
-                readAllVaults()
-                drawVaultsMonitor()
-                -- Also refresh vaults list if we're on that screen, so % updates
-                if screen == "vaults" then drawCurrent() end
-                vaultTimer = os.startTimer(2)
             end
 
         elseif ev[1] == "peripheral" then
             readStress()
-            readAllVaults()
             drawCurrent()
             drawStressMonitor()
-            drawVaultsMonitor()
+            -- vaultPollLoop will refresh vault data on its own cycle
 
         elseif ev[1] == "peripheral_detach" then
             local n = ev[2]
@@ -1293,7 +1305,6 @@ local function monitorLoop()
                 stressData = nil
                 drawStressMonitor()
             end
-            -- Any vault using this peripheral is now invalid; readAllVaults next tick will mark it
             for _, v in ipairs(config.vaults) do
                 if v.peripheral == n then
                     vaultData[v.id] = { valid = false, pct = 0, slotsUsed = 0, slotsTotal = 0, name = v.name }
@@ -1321,4 +1332,4 @@ end
 -- Apply current state to all relays so reboot doesn't leave farms in random state.
 applyAllFarms()
 
-parallel.waitForAny(monitorLoop, consoleLoop)
+parallel.waitForAny(monitorLoop, consoleLoop, vaultPollLoop)
