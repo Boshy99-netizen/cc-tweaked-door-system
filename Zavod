@@ -1,5 +1,5 @@
 -- ============================================
--- STRESS CONTROL v1.4
+-- STRESS CONTROL v1.5
 -- Standalone program for toggling farms via inverted redstone relays.
 -- Relay HIGH = farm OFF (powered = stops the contraption)
 -- Relay LOW  = farm ON  (no signal = farm runs)
@@ -30,26 +30,24 @@ local function getBuffer(mon, monName)
     return win
 end
 
--- Suspend rendering on all monitors (call at start of a draw cycle)
-local function beginFrame()
-    for _, entry in pairs(monWindows) do
-        if entry.win then
-            entry.win.setVisible(false)
-        end
+-- Suspend rendering on ONE specific monitor (call at start of its redraw)
+local function beginFrame(monName)
+    local entry = monName and monWindows[monName]
+    if entry and entry.win then
+        entry.win.setVisible(false)
     end
 end
 
--- Resume rendering (call after draw is complete; this flushes to monitors)
-local function endFrame()
-    for _, entry in pairs(monWindows) do
-        if entry.win then
-            entry.win.setVisible(true)
-        end
+-- Resume rendering (call after draw is complete; flushes that monitor)
+local function endFrame(monName)
+    local entry = monName and monWindows[monName]
+    if entry and entry.win then
+        entry.win.setVisible(true)
     end
 end
 
--- Backwards-compat alias used elsewhere
-local function flushAllMonitors() endFrame() end
+-- Compat alias (no-op now; old code that called it shouldn't blank everything)
+local function flushAllMonitors() end
 
 -- ============================================ STATE ============================================
 
@@ -392,8 +390,19 @@ end
 
 -- ============================================ MAIN SCREEN ============================================
 
+local prevMainHash = nil
 local function drawMain(force)
     local mon = getMon(); if not mon then return end
+
+    -- Anti-flicker: hash all visible state
+    local parts = {}
+    for _, f in ipairs(config.farms) do
+        table.insert(parts, f.id .. ":" .. f.name .. ":" .. tostring(f.enabled))
+    end
+    local hash = table.concat(parts, "|")
+    if not force and hash == prevMainHash then return end
+    prevMainHash = hash
+
     layoutCache = {}
     local _, w, h = autoScale(mon, 16, 8)
     mon.setBackgroundColor(colors.black); mon.clear()
@@ -442,8 +451,22 @@ end
 
 -- ============================================ STRESS MONITOR ============================================
 
+local prevStressHash = nil
 local function drawStressMonitor()
     local mon = getStressMon(); if not mon then return end
+
+    -- Anti-flicker: skip redraw if visible content hasn't changed
+    local hash
+    if stressData and stressData.capacity > 0 then
+        hash = string.format("%.1f|%.1f", stressData.current, stressData.capacity)
+    elseif stressData then
+        hash = "idle|" .. tostring(math.floor(stressData.current))
+    else
+        hash = "none"
+    end
+    if hash == prevStressHash then return end
+    prevStressHash = hash
+
     local _, w, h = autoScale(mon, 16, 8)
     mon.setBackgroundColor(colors.black); mon.clear()
 
@@ -538,8 +561,26 @@ local function vaultColor(pct)
     return colors.gray
 end
 
+local prevVaultsHash = nil
 local function drawVaultsMonitor()
     local mon = getAnimMon(); if not mon then return end
+
+    -- Anti-flicker: hash all vault states; skip if identical to last draw
+    local parts = {}
+    for _, v in ipairs(config.vaults) do
+        local d = vaultData[v.id]
+        if d then
+            table.insert(parts, v.id .. ":" .. v.name .. ":" ..
+                (d.valid and "1" or "0") .. ":" ..
+                string.format("%.0f", d.pct))
+        else
+            table.insert(parts, v.id .. ":" .. v.name .. ":pending")
+        end
+    end
+    local hash = table.concat(parts, "|")
+    if hash == prevVaultsHash then return end
+    prevVaultsHash = hash
+
     local _, w, h = autoScale(mon, 16, 10)
     mon.setBackgroundColor(colors.black); mon.clear()
 
@@ -1062,19 +1103,19 @@ do
     local _drawStress  = drawStressMonitor
     local _drawVaults  = drawVaultsMonitor
     drawCurrent = function()
-        beginFrame()
+        beginFrame(config.controlMonitor)
         _drawCurrent()
-        endFrame()
+        endFrame(config.controlMonitor)
     end
     drawStressMonitor = function()
-        beginFrame()
+        beginFrame(config.stressMonitor)
         _drawStress()
-        endFrame()
+        endFrame(config.stressMonitor)
     end
     drawVaultsMonitor = function()
-        beginFrame()
+        beginFrame(config.animMonitor)
         _drawVaults()
-        endFrame()
+        endFrame(config.animMonitor)
     end
 end
 
@@ -1115,7 +1156,7 @@ local function handleAction(action)
         end
 
     elseif screen == "settings" then
-        if action == "back" then screen = "main"; drawCurrent(); return end
+        if action == "back" then screen = "main"; prevMainHash = nil; drawCurrent(); return end
         if action == "add_farm" then
             addDraft = {}; addBuf = ""; screen = "add_name"; drawCurrent(); return
         end
@@ -1324,7 +1365,7 @@ end
 
 local function showConsoleSummary()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
-    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.4 ===")
+    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.5 ===")
     term.setTextColor(colors.white)
     print("Control: " .. (config.controlMonitor or "?"))
     print("Stress:  " .. (config.stressMonitor or "(none)"))
