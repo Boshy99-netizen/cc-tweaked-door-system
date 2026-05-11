@@ -1,5 +1,5 @@
 -- ============================================
--- STRESS CONTROL v1.3
+-- STRESS CONTROL v1.4
 -- Standalone program for toggling farms via inverted redstone relays.
 -- Relay HIGH = farm OFF (powered = stops the contraption)
 -- Relay LOW  = farm ON  (no signal = farm runs)
@@ -7,7 +7,8 @@
 
 -- ============================================ BUFFERED DRAW (must be FIRST) ============================================
 -- Window-based double buffering to eliminate flicker.
--- Declared at top of file so all later code can call these without forward-declaration issues.
+-- Pattern: hide window only briefly during redraw, then make visible.
+-- Visible window stays on monitor between frames (no parent blanking).
 
 local monWindows = {}  -- monitor name -> {win}
 
@@ -19,7 +20,8 @@ local function getBuffer(mon, monName)
         local cw, ch = cached.win.getSize()
         if cw == w and ch == h then return cached.win end
     end
-    local ok, win = pcall(window.create, mon, 1, 1, w, h, false)
+    -- Create VISIBLE by default; we toggle off only briefly during a redraw.
+    local ok, win = pcall(window.create, mon, 1, 1, w, h, true)
     if not ok or not win then
         monWindows[monName] = nil
         return mon
@@ -28,14 +30,26 @@ local function getBuffer(mon, monName)
     return win
 end
 
-local function flushAllMonitors()
+-- Suspend rendering on all monitors (call at start of a draw cycle)
+local function beginFrame()
     for _, entry in pairs(monWindows) do
         if entry.win then
-            entry.win.setVisible(true)
             entry.win.setVisible(false)
         end
     end
 end
+
+-- Resume rendering (call after draw is complete; this flushes to monitors)
+local function endFrame()
+    for _, entry in pairs(monWindows) do
+        if entry.win then
+            entry.win.setVisible(true)
+        end
+    end
+end
+
+-- Backwards-compat alias used elsewhere
+local function flushAllMonitors() endFrame() end
 
 -- ============================================ STATE ============================================
 
@@ -1041,24 +1055,26 @@ local function drawCurrent()
     end
 end
 
--- Wrap drawing functions so buffer flushes automatically after each call.
--- This eliminates flicker: all writes happen on invisible window, then
--- single setVisible(true) blits the whole frame to the physical monitor.
+-- Wrap drawing functions so that visible monitor stays static while we redraw
+-- the offscreen buffer, then flip to the new frame in one operation.
 do
     local _drawCurrent = drawCurrent
     local _drawStress  = drawStressMonitor
     local _drawVaults  = drawVaultsMonitor
     drawCurrent = function()
+        beginFrame()
         _drawCurrent()
-        flushAllMonitors()
+        endFrame()
     end
     drawStressMonitor = function()
+        beginFrame()
         _drawStress()
-        flushAllMonitors()
+        endFrame()
     end
     drawVaultsMonitor = function()
+        beginFrame()
         _drawVaults()
-        flushAllMonitors()
+        endFrame()
     end
 end
 
@@ -1308,7 +1324,7 @@ end
 
 local function showConsoleSummary()
     term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
-    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.3 ===")
+    term.setTextColor(colors.cyan); print("=== STRESS CONTROL v1.4 ===")
     term.setTextColor(colors.white)
     print("Control: " .. (config.controlMonitor or "?"))
     print("Stress:  " .. (config.stressMonitor or "(none)"))
